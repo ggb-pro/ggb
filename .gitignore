@@ -23,3 +23,7 @@ Thumbs.db
 
 # Data
 /data/
+*.db
+__pycache__/
+*.pyc
+data/

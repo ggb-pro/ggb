@@ -9,15 +9,14 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
 
-    # PostgreSQL
-    database_url: str = "postgresql+asyncpg://knspace:knspace_dev@localhost:5432/knspace"
+    # Database (SQLite for local, PostgreSQL for production)
+    database_url: str = "sqlite+aiosqlite:///./knspace.db"
 
-    # Redis
+    # Redis (not used in local mode)
     redis_url: str = "redis://localhost:6379/0"
 
-    # Milvus
-    milvus_host: str = "localhost"
-    milvus_port: int = 19530
+    # Milvus (local file for dev, cluster for production)
+    milvus_uri: str = "./milvus_data.db"
 
     # Embedding
     embedding_api_url: str = ""

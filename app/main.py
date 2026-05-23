@@ -15,19 +15,7 @@ async def lifespan(app: FastAPI):
     # Startup: create tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    # Ensure Milvus collection exists
-    try:
-        from app.deps import get_milvus
-        from app.services.vector_store import ensure_collection
-        client = get_milvus()
-        ensure_collection(client)
-    except Exception as e:
-        print(f"Warning: Milvus not available at startup: {e}")
-
     yield
-
-    # Shutdown
     await engine.dispose()
 
 

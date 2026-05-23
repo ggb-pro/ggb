@@ -32,13 +32,18 @@ class LLMService:
 
         # Add history (last 3 turns)
         if history:
-            for msg in history[-6:]:  # 3 turns = 6 messages
+            for msg in history[-6:]:
                 messages.append({"role": msg.role, "content": msg.content})
 
-        # Add current query with context
         messages.append({"role": "user", "content": query})
-
         system = SYSTEM_PROMPT.format(context=context) if context else "你是一个知识库助手。"
+
+        # Fallback for local testing without real API key
+        if not settings.llm_api_key or settings.llm_api_key == "your-api-key-here":
+            answer = f"（本地测试模式，未配置 LLM API）\n\n基于参考信息的模拟回答：\n{context[:200]}..."
+            for char in answer:
+                yield char
+            return
 
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(

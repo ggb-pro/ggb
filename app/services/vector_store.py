@@ -1,99 +1,67 @@
-"""Milvus vector store service."""
+"""In-memory vector store for local dev. Swappable with Milvus in production."""
 
-import uuid
-from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
-from app.config import get_settings
+import numpy as np
+from dataclasses import dataclass, field
 
-settings = get_settings()
-
-COLLECTION_NAME = "knowledge_chunks"
-VECTOR_DIM = 1024  # bge-m3 output dimension
+_store: "VectorStore | None" = None
 
 
-def get_collection_name() -> str:
-    return COLLECTION_NAME
+@dataclass
+class VectorRecord:
+    chunk_id: str
+    user_id: str
+    document_id: str
+    vector: np.ndarray
+    snippet: str
 
 
-def ensure_collection(client: MilvusClient):
-    """Create collection if not exists."""
-    if client.has_collection(COLLECTION_NAME):
-        return
+class VectorStore:
+    """Simple in-memory vector store using numpy cosine similarity."""
 
-    schema = CollectionSchema(fields=[
-        FieldSchema("chunk_id", DataType.VARCHAR, max_length=36, is_primary=True),
-        FieldSchema("user_id", DataType.VARCHAR, max_length=36),
-        FieldSchema("document_id", DataType.VARCHAR, max_length=36),
-        FieldSchema("vector", DataType.FLOAT_VECTOR, dim=VECTOR_DIM),
-        FieldSchema("content_snippet", DataType.VARCHAR, max_length=500),
-    ], description="Knowledge chunks")
+    def __init__(self):
+        self.records: list[VectorRecord] = []
 
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        schema=schema,
-    )
+    def insert(self, chunk_ids: list[str], user_id: str, document_id: str,
+               vectors: list[list[float]], snippets: list[str]):
+        for cid, vec, snip in zip(chunk_ids, vectors, snippets):
+            self.records.append(VectorRecord(
+                chunk_id=cid, user_id=user_id, document_id=document_id,
+                vector=np.array(vec, dtype=np.float32), snippet=snip[:500],
+            ))
 
-    # Create index
-    client.create_index(
-        collection_name=COLLECTION_NAME,
-        field_name="vector",
-        index_params={"metric_type": "COSINE", "index_type": "FLAT"},  # FLAT for small scale
-    )
+    def search(self, query_vector: list[float], user_id: str, top_k: int = 20) -> list[dict]:
+        if not self.records:
+            return []
 
+        # Filter by user
+        user_records = [r for r in self.records if r.user_id == user_id]
+        if not user_records:
+            return []
 
-def insert_vectors(
-    client: MilvusClient,
-    chunk_ids: list[str],
-    user_id: str,
-    document_id: str,
-    vectors: list[list[float]],
-    snippets: list[str],
-):
-    """Insert chunk vectors into Milvus."""
-    data = [
-        {
-            "chunk_id": cid,
-            "user_id": user_id,
-            "document_id": document_id,
-            "vector": vec,
-            "content_snippet": s[:500],
-        }
-        for cid, vec, s in zip(chunk_ids, vectors, snippets)
-    ]
-    client.insert(collection_name=COLLECTION_NAME, data=data)
+        # Cosine similarity
+        q = np.array(query_vector, dtype=np.float32)
+        q_norm = q / (np.linalg.norm(q) + 1e-8)
+
+        scores = []
+        for r in user_records:
+            v_norm = r.vector / (np.linalg.norm(r.vector) + 1e-8)
+            score = float(np.dot(q_norm, v_norm))
+            scores.append((score, r))
+
+        scores.sort(key=lambda x: x[0], reverse=True)
+
+        return [
+            {"chunk_id": r.chunk_id, "document_id": r.document_id,
+             "score": s, "snippet": r.snippet}
+            for s, r in scores[:top_k]
+        ]
+
+    def delete_by_document(self, document_id: str):
+        self.records = [r for r in self.records if r.document_id != document_id]
 
 
-def search_vectors(
-    client: MilvusClient,
-    query_vector: list[float],
-    user_id: str,
-    top_k: int = 20,
-) -> list[dict]:
-    """Search similar vectors for a user."""
-    results = client.search(
-        collection_name=COLLECTION_NAME,
-        data=[query_vector],
-        limit=top_k,
-        filter=f'user_id == "{user_id}"',
-        output_fields=["chunk_id", "document_id", "content_snippet"],
-        search_params={"metric_type": "COSINE"},
-    )
-    if not results or not results[0]:
-        return []
-
-    return [
-        {
-            "chunk_id": hit["entity"]["chunk_id"],
-            "document_id": hit["entity"]["document_id"],
-            "score": hit["distance"],
-            "snippet": hit["entity"]["content_snippet"],
-        }
-        for hit in results[0]
-    ]
-
-
-def delete_by_document(client: MilvusClient, document_id: str):
-    """Delete all vectors for a document."""
-    client.delete(
-        collection_name=COLLECTION_NAME,
-        filter=f'document_id == "{document_id}"',
-    )
+def get_vector_store() -> VectorStore:
+    global _store
+    if _store is None:
+        _store = VectorStore()
+    return _store

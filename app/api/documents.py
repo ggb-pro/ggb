@@ -45,9 +45,9 @@ async def upload(
 
     # Create DB record
     doc = Document(
-        id=uuid.UUID(doc_id),
+        id=str(doc_id),
         user_id=user.id,
-        collection_id=uuid.UUID(collection_id) if collection_id else None,
+        collection_id=str(collection_id) if collection_id else None,
         title=file.filename or doc_id,
         source_type="upload",
         file_path=file_path,
@@ -60,16 +60,23 @@ async def upload(
     await db.commit()
     await db.refresh(doc)
 
-    # Trigger async processing
-    from app.tasks.document import process_document
-    process_document.delay(str(doc.id), str(user.id))
+    # Process document synchronously (local mode, no Celery)
+    try:
+        from app.services.doc_processor import process_document_sync
+        process_document_sync(str(doc.id), str(user.id), db)
+        await db.refresh(doc)
+    except Exception as e:
+        doc.processing_status = "failed"
+        doc.processing_error = str(e)
+        await db.commit()
+        await db.refresh(doc)
 
     return doc
 
 
 @router.get("", response_model=list[DocumentOut])
 async def list_docs(
-    collection_id: uuid.UUID | None = None,
+    collection_id: str | None = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     user: User = Depends(get_current_user),
@@ -85,7 +92,7 @@ async def list_docs(
 
 @router.get("/{doc_id}", response_model=DocumentOut)
 async def get_doc(
-    doc_id: uuid.UUID,
+    doc_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -100,7 +107,7 @@ async def get_doc(
 
 @router.delete("/{doc_id}")
 async def delete_doc(
-    doc_id: uuid.UUID,
+    doc_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
