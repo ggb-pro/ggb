@@ -8,7 +8,7 @@ from app.deps import get_db, engine
 from app.models.user import User
 from app.models.conversation import Conversation
 from app.models.message import Message
-from app.schemas.chat import ChatRequest
+from app.schemas.chat import ChatRequest, ChatMessage
 from app.utils.security import get_current_user
 from app.services.search import SearchService
 from app.services.llm import LLMService
@@ -94,8 +94,9 @@ async def chat(
 
                 full_answer = ""
                 # Build history for LLM from loaded messages
-                chat_history = history_messages if history_messages else (
-                    [{"role": m.role, "content": m.content} for m in (req.history or [])]
+                chat_history = (
+                    [ChatMessage(role=m["role"], content=m["content"]) for m in history_messages]
+                    if history_messages else (req.history or [])
                 )
                 async for token in llm_svc.stream_generate(req.query, context, history=chat_history):
                     full_answer += token
