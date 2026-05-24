@@ -12,6 +12,7 @@ from app.schemas.chat import ChatRequest
 from app.utils.security import get_current_user
 from app.services.search import SearchService
 from app.services.llm import LLMService
+from app.services.multi_turn import resolve_query_with_history
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
@@ -56,12 +57,32 @@ async def chat(
     user_id = str(user.id)
 
     async def event_stream():
-        # Use a separate DB session for streaming operations
-        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as stream_db:
             try:
                 yield f"data: {json.dumps({'type': 'status', 'message': 'Searching...'})}\n\n"
-                search_results = await search_svc.search(req.query, user_id, collection_id=req.collection_id)
+
+                # Load conversation history for multi-turn resolution
+                history_messages = []
+                if req.conversation_id:
+                    hist_result = await stream_db.execute(
+                        select(Message).where(
+                            Message.conversation_id == conversation.id,
+                        ).order_by(Message.created_at.desc()).limit(6)
+                    )
+                    for m in reversed(hist_result.scalars().all()):
+                        history_messages.append({"role": m.role, "content": m.content})
+
+                # Resolve references in query
+                resolved_query = await resolve_query_with_history(
+                    req.query, history_messages
+                )
+
+                search_results = await search_svc.search(
+                    resolved_query, user_id,
+                    collection_id=str(req.collection_id) if req.collection_id else None,
+                    history=[m["content"] for m in history_messages] if history_messages else None,
+                )
 
                 context = search_svc.build_context(search_results)
                 citations = [
@@ -72,11 +93,15 @@ async def chat(
                 yield f"data: {json.dumps({'type': 'citations', 'data': citations})}\n\n"
 
                 full_answer = ""
-                async for token in llm_svc.stream_generate(req.query, context, history=req.history):
+                # Build history for LLM from loaded messages
+                chat_history = history_messages if history_messages else (
+                    [{"role": m.role, "content": m.content} for m in (req.history or [])]
+                )
+                async for token in llm_svc.stream_generate(req.query, context, history=chat_history):
                     full_answer += token
                     yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-                # Save assistant message in separate session
+                # Save assistant message
                 assistant_msg = Message(
                     conversation_id=conversation.id,
                     user_id=user.id,

@@ -17,4 +17,5 @@ class Message(Base):
     citations: Mapped[dict | None] = mapped_column(JSONB)
     token_count: Mapped[int | None] = mapped_column(Integer)
     model_name: Mapped[str | None] = mapped_column(String(50))
+    feedback: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)

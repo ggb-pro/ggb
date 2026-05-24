@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.deps import engine
 from app.models.base import Base
-from app.api import auth, documents, chat
+from app.api import auth, documents, chat, collections, conversations, eval
 
 settings = get_settings()
 
@@ -43,6 +43,9 @@ except ImportError:
 app.include_router(auth.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
+app.include_router(collections.router)
+app.include_router(conversations.router)
+app.include_router(eval.router)
 
 
 @app.get("/health")

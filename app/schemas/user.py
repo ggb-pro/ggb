@@ -13,12 +13,28 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserUpdate(BaseModel):
+    display_name: str | None = None
+    avatar_url: str | None = None
+    settings: dict | None = None
+
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class UserOut(BaseModel):
     id: uuid.UUID
     email: str
     display_name: str | None
     plan_type: str
     avatar_url: str | None
+    settings: dict | None = None
 
     model_config = {"from_attributes": True}
 

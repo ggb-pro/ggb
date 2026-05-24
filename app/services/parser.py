@@ -32,6 +32,8 @@ def parse_file(file_path: str, mime_type: str | None = None) -> ParsedDocument:
         return _parse_markdown(file_path)
     elif ext in (".txt", ".text"):
         return _parse_text(file_path)
+    elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"):
+        return _parse_image(file_path)
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
@@ -138,3 +140,19 @@ def _parse_text(file_path: str) -> ParsedDocument:
 
     sections = [ParsedSection(content=p.strip()) for p in text.split("\n\n") if p.strip()]
     return ParsedDocument(title=os.path.basename(file_path), sections=sections, raw_text=text)
+
+
+def _parse_image(file_path: str) -> ParsedDocument:
+    """OCR extract text from image files."""
+    from app.services.ocr import ocr_image
+
+    text = ocr_image(file_path)
+    title = os.path.basename(file_path)
+
+    if not text.strip():
+        return ParsedDocument(title=title, sections=[], raw_text="")
+
+    # Split OCR text into paragraphs
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    sections = [ParsedSection(content=p) for p in paragraphs]
+    return ParsedDocument(title=title, sections=sections, raw_text=text)

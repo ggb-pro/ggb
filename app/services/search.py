@@ -1,4 +1,4 @@
-"""Search service: hybrid search (vector + BM25) + RRF fusion + rerank."""
+"""Search service: hybrid search (vector + BM25) + RRF fusion + rerank + query understanding."""
 
 import logging
 from sqlalchemy import select, text, func
@@ -9,15 +9,16 @@ from app.deps import engine
 from app.models.chunk import Chunk
 from app.services.embedding import embed_query
 from app.services.vector_store import get_vector_store
+from app.services.query_analyzer import QueryAnalyzer
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# RRF parameters
-RRF_K = 60  # RRF constant
-VECTOR_WEIGHT = 0.7  # vector search weight
-BM25_WEIGHT = 0.3  # BM25 search weight
-RERANK_TOP_K = 5  # final results after rerank
+RRF_K = 60
+CANDIDATE_TOP_K = 40  # candidates before rerank (was 20)
+RERANK_TOP_K = 10  # final results after rerank (was 5)
+
+_analyzer = QueryAnalyzer()
 
 
 class SearchService:
@@ -25,24 +26,31 @@ class SearchService:
         self,
         query: str,
         user_id: str,
-        top_k: int = 20,
+        top_k: int = CANDIDATE_TOP_K,
         collection_id: str | None = None,
+        history: list[str] | None = None,
     ) -> list[dict]:
-        # Step 1: Vector search
-        query_vector = await embed_query(query)
-        store = get_vector_store()
-        vector_results = store.search(query_vector, user_id, top_k=top_k)
+        # Step 0: Query analysis
+        analyzed = _analyzer.analyze(query, history=history)
+        search_query = analyzed.rewritten
+        vector_weight = analyzed.vector_weight
+        bm25_weight = analyzed.bm25_weight
 
-        # Step 2: BM25 full-text search via PG FTS
-        bm25_results = await self._bm25_search(query, user_id, top_k)
-
-        # Step 3: RRF fusion
-        fused = self._rrf_fuse(vector_results, bm25_results)
+        # Step 1: Search (for compare/decompose, merge sub-query results)
+        if len(analyzed.sub_queries) > 1:
+            all_fused = {}
+            for sq in analyzed.sub_queries:
+                fused = await self._single_search(sq, user_id, top_k, vector_weight, bm25_weight)
+                for cid, score in fused.items():
+                    all_fused[cid] = all_fused.get(cid, 0) + score
+            fused = dict(sorted(all_fused.items(), key=lambda x: x[1], reverse=True))
+        else:
+            fused = await self._single_search(search_query, user_id, top_k, vector_weight, bm25_weight)
 
         if not fused:
             return []
 
-        # Step 4: Fetch full chunk content
+        # Step 2: Fetch full chunk content
         chunk_ids = list(fused.keys())
         chunks_map = await self._fetch_chunks(chunk_ids, user_id)
 
@@ -56,20 +64,31 @@ class SearchService:
                     "score": score,
                     "content": chunk["content"],
                     "page_number": chunk.get("page_number"),
+                    "parent_content": chunk.get("parent_content"),
                 })
 
         results.sort(key=lambda x: x["score"], reverse=True)
-        candidates = results[:20]
+        candidates = results[:CANDIDATE_TOP_K]
 
-        # Step 5: Rerank
-        reranked = await self._rerank(query, candidates)
+        # Step 3: Rerank
+        reranked = await self._rerank(search_query, candidates)
         return reranked[:RERANK_TOP_K]
 
-    def build_context(self, results: list[dict], max_tokens: int = 6000) -> str:
+    async def _single_search(
+        self, query: str, user_id: str, top_k: int,
+        vector_weight: float, bm25_weight: float,
+    ) -> dict[str, float]:
+        """Run vector + BM25 search and RRF fuse with given weights."""
+        query_vector = await embed_query(query)
+        store = get_vector_store()
+        vector_results = store.search(query_vector, user_id, top_k=top_k)
+        bm25_results = await self._bm25_search(query, user_id, top_k)
+        return self._rrf_fuse(vector_results, bm25_results, vector_weight, bm25_weight)
+
+    def build_context(self, results: list[dict], max_tokens: int = 8000) -> str:
         context_parts = []
         used_tokens = 0
         for i, r in enumerate(results):
-            # Use parent content for richer context when available
             content = r.get("parent_content") or r["content"]
             approx_tokens = len(content)
             if used_tokens + approx_tokens > max_tokens:
@@ -82,17 +101,19 @@ class SearchService:
         self,
         vector_results: list[dict],
         bm25_results: list[dict],
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
     ) -> dict[str, float]:
         """Reciprocal Rank Fusion of vector and BM25 results."""
         scores: dict[str, float] = {}
 
         for rank, r in enumerate(vector_results):
             cid = r["chunk_id"]
-            scores[cid] = scores.get(cid, 0) + VECTOR_WEIGHT / (RRF_K + rank + 1)
+            scores[cid] = scores.get(cid, 0) + vector_weight / (RRF_K + rank + 1)
 
         for rank, r in enumerate(bm25_results):
             cid = r["chunk_id"]
-            scores[cid] = scores.get(cid, 0) + BM25_WEIGHT / (RRF_K + rank + 1)
+            scores[cid] = scores.get(cid, 0) + bm25_weight / (RRF_K + rank + 1)
 
         return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
 
@@ -133,7 +154,6 @@ class SearchService:
 
             pairs = [[query, c["content"]] for c in candidates]
             raw_scores = reranker.predict(pairs)
-            # predict() may return numpy array or list — normalize to flat Python floats
             try:
                 scores = raw_scores.tolist()
             except AttributeError:
@@ -181,13 +201,11 @@ class SearchService:
             )
             chunks = result.scalars().all()
 
-            # Collect parent chunk IDs for child chunks that have parents
             parent_ids = set()
             for chunk in chunks:
                 if chunk.parent_chunk_id:
                     parent_ids.add(str(chunk.parent_chunk_id))
 
-            # Fetch parent chunks if not already in results
             existing_ids = {str(c.id) for c in chunks}
             missing_parent_ids = parent_ids - existing_ids
             parent_map = {}
@@ -203,7 +221,6 @@ class SearchService:
                     }
 
             for chunk in chunks:
-                # Use parent content for richer context if available
                 parent_data = parent_map.get(str(chunk.parent_chunk_id)) if chunk.parent_chunk_id else None
                 chunks_map[str(chunk.id)] = {
                     "content": chunk.content,
