@@ -69,10 +69,12 @@ class SearchService:
         context_parts = []
         used_tokens = 0
         for i, r in enumerate(results):
-            approx_tokens = len(r["content"])
+            # Use parent content for richer context when available
+            content = r.get("parent_content") or r["content"]
+            approx_tokens = len(content)
             if used_tokens + approx_tokens > max_tokens:
                 break
-            context_parts.append(f"[{i + 1}] {r['content']}")
+            context_parts.append(f"[{i + 1}] {content}")
             used_tokens += approx_tokens
         return "\n\n".join(context_parts)
 
@@ -102,13 +104,10 @@ class SearchService:
                 sql = text("""
                     SELECT c.id::text as chunk_id,
                            c.document_id::text as document_id,
-                           ts_rank_cd(
-                               to_tsvector('simple', c.content),
-                               plainto_tsquery('simple', :query)
-                           ) as score
+                           ts_rank_cd(c.fts_vector, plainto_tsquery('simple', :query)) as score
                     FROM chunks c
                     WHERE c.user_id::text = :user_id
-                      AND to_tsvector('simple', c.content) @@ plainto_tsquery('simple', :query)
+                      AND c.fts_vector @@ plainto_tsquery('simple', :query)
                     ORDER BY score DESC
                     LIMIT :limit
                 """)
@@ -133,12 +132,16 @@ class SearchService:
                 return candidates
 
             pairs = [[query, c["content"]] for c in candidates]
-            scores = reranker.compute_score(pairs)
-            if not isinstance(scores, list):
-                scores = [scores]
+            raw_scores = reranker.predict(pairs)
+            # predict() may return numpy array or list — normalize to flat Python floats
+            try:
+                scores = raw_scores.tolist()
+            except AttributeError:
+                scores = raw_scores if isinstance(raw_scores, list) else [raw_scores]
+            scores = [float(s) for s in scores]
 
             for i, score in enumerate(scores):
-                candidates[i]["score"] = float(score)
+                candidates[i]["score"] = score
 
             candidates.sort(key=lambda x: x["score"], reverse=True)
             logger.info(f"Reranked {len(candidates)} candidates")
@@ -176,10 +179,36 @@ class SearchService:
             result = await db.execute(
                 select(Chunk).where(Chunk.id.in_(chunk_ids), Chunk.user_id == user_id)
             )
-            for chunk in result.scalars().all():
+            chunks = result.scalars().all()
+
+            # Collect parent chunk IDs for child chunks that have parents
+            parent_ids = set()
+            for chunk in chunks:
+                if chunk.parent_chunk_id:
+                    parent_ids.add(str(chunk.parent_chunk_id))
+
+            # Fetch parent chunks if not already in results
+            existing_ids = {str(c.id) for c in chunks}
+            missing_parent_ids = parent_ids - existing_ids
+            parent_map = {}
+            if missing_parent_ids:
+                parent_result = await db.execute(
+                    select(Chunk).where(Chunk.id.in_(list(missing_parent_ids)), Chunk.user_id == user_id)
+                )
+                for p in parent_result.scalars().all():
+                    parent_map[str(p.id)] = {
+                        "content": p.content,
+                        "document_id": str(p.document_id),
+                        "page_number": p.page_number,
+                    }
+
+            for chunk in chunks:
+                # Use parent content for richer context if available
+                parent_data = parent_map.get(str(chunk.parent_chunk_id)) if chunk.parent_chunk_id else None
                 chunks_map[str(chunk.id)] = {
                     "content": chunk.content,
                     "document_id": str(chunk.document_id),
                     "page_number": chunk.page_number,
+                    "parent_content": parent_data["content"] if parent_data else None,
                 }
         return chunks_map
