@@ -39,6 +39,9 @@ sentence-transformers==3.3.1
 # Text processing
 tiktoken==0.9.0
 
+# Monitoring
+prometheus-fastapi-instrumentator==7.1.0
+
 # Utils
 pydantic-settings==2.7.1
 pydantic==2.10.4

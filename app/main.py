@@ -29,6 +29,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus metrics
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+except ImportError:
+    pass
+
 # Register routers
 app.include_router(auth.router)
 app.include_router(documents.router)
