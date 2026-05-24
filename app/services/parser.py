@@ -100,22 +100,36 @@ def _parse_markdown(file_path: str) -> ParsedDocument:
         text = f.read()
 
     sections = []
+    # Group lines by paragraph (separated by blank lines)
+    current_lines: list[str] = []
     for line in text.split("\n"):
         stripped = line.strip()
         if not stripped:
-            continue
-        level = 0
-        section_type = "text"
-        if stripped.startswith("#"):
-            level = len(stripped) - len(stripped.lstrip("#"))
-            section_type = "heading"
-        sections.append(ParsedSection(content=stripped, section_type=section_type, level=level))
+            if current_lines:
+                combined = " ".join(current_lines)
+                sections.append(_classify_line(combined))
+                current_lines = []
+        else:
+            current_lines.append(stripped)
+    if current_lines:
+        combined = " ".join(current_lines)
+        sections.append(_classify_line(combined))
 
     title = os.path.basename(file_path)
     if sections and sections[0].section_type == "heading":
         title = sections[0].content.lstrip("# ").strip()
 
     return ParsedDocument(title=title, sections=sections, raw_text=text)
+
+
+def _classify_line(text: str) -> ParsedSection:
+    level = 0
+    section_type = "text"
+    stripped = text.strip()
+    if stripped.startswith("#"):
+        level = len(stripped) - len(stripped.lstrip("#"))
+        section_type = "heading"
+    return ParsedSection(content=stripped, section_type=section_type, level=level)
 
 
 def _parse_text(file_path: str) -> ParsedDocument:

@@ -6,7 +6,7 @@ import re
 # Target: ~512 tokens ≈ ~400 Chinese chars or ~350 English words
 CHUNK_SIZE = 400  # chars (approximate token count for mixed CJK)
 CHUNK_OVERLAP = 50  # chars
-MIN_CHUNK_SIZE = 50
+MIN_CHUNK_SIZE = 20
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[dict]:

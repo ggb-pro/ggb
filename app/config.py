@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
-    # Milvus
-    milvus_uri: str = "./milvus_data.db"
+    # Vector store (Milvus Lite file URI - named differently to avoid pymilvus auto-reading)
+    vector_store_uri: str = "./milvus_data.db"
 
     # Embedding (API fallback, primary is local bge-m3)
     embedding_api_url: str = ""

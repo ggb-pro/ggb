@@ -54,6 +54,7 @@ async def process_document(doc_id: str, user_id: str):
                 page_number=cd["page_number"], token_count=len(cd["content"]),
             ))
         await db.commit()
+        logger.info(f"Committed {len(all_data)} chunks to DB")
 
         # Embed
         doc.processing_status = "embedding"
