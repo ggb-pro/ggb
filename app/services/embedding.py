@@ -18,6 +18,9 @@ def _load_model():
     if _model is not None:
         return _model
     try:
+        import os
+        if not os.environ.get("HF_ENDPOINT"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
         from sentence_transformers import SentenceTransformer
         logger.info("Loading bge-m3 model...")
         _model = SentenceTransformer(

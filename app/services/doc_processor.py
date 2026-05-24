@@ -1,10 +1,10 @@
-"""Synchronous document processor for local dev."""
+"""Document processor: parse → chunk → embed → index."""
 
 import uuid
 import asyncio
 import logging
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.document import Document
 from app.models.chunk import Chunk
@@ -16,31 +16,18 @@ from app.services.vector_store import get_vector_store
 logger = logging.getLogger(__name__)
 
 
-def process_document_sync(doc_id: str, user_id: str, db: AsyncSession):
-    """Run processing pipeline. Uses existing event loop since we're in async handler."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # We're inside an async handler, schedule and wait
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, _process(doc_id, user_id))
-            future.result()
-    else:
-        loop.run_until_complete(_process(doc_id, user_id))
-
-
-async def _process(doc_id: str, user_id: str):
+async def process_document(doc_id: str, user_id: str):
+    """Process document entirely within the current event loop."""
     from app.deps import engine
-    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as db:
-        result = await db.execute(select(Document).where(Document.id == str(doc_id)))
+        result = await db.execute(select(Document).where(Document.id == doc_id))
         doc = result.scalar_one_or_none()
         if not doc:
             return
 
-        # Parse
+        # Parse (CPU-bound, but fast)
         doc.processing_status = "parsing"
         await db.commit()
         parsed = parse_file(doc.file_path, doc.mime_type)
@@ -58,8 +45,8 @@ async def _process(doc_id: str, user_id: str):
 
         chunk_ids = []
         for i, cd in enumerate(all_data):
-            cid = str(uuid.uuid4())
-            chunk_ids.append(cid)
+            cid = uuid.uuid4()
+            chunk_ids.append(str(cid))
             db.add(Chunk(
                 id=cid, document_id=doc.id, user_id=doc.user_id,
                 content=cd["content"], chunk_index=i, chunk_type="text",
@@ -77,9 +64,9 @@ async def _process(doc_id: str, user_id: str):
             vectors = await embed_texts(texts[i:i + 64])
             all_vectors.extend(vectors)
 
-        # Index into memory vector store
+        # Index into vector store
         store = get_vector_store()
-        store.insert(chunk_ids, user_id, doc_id, all_vectors, texts)
+        store.insert(chunk_ids, str(user_id), str(doc.id), all_vectors, texts)
 
         doc.processing_status = "ready"
         await db.commit()

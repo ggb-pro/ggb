@@ -1,15 +1,14 @@
-import uuid
 import json
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.deps import get_db
+from app.deps import get_db, engine
 from app.models.user import User
 from app.models.conversation import Conversation
 from app.models.message import Message
-from app.schemas.chat import ChatRequest, ChatMessage
+from app.schemas.chat import ChatRequest
 from app.utils.security import get_current_user
 from app.services.search import SearchService
 from app.services.llm import LLMService
@@ -39,12 +38,11 @@ async def chat(
         conversation = result.scalar_one_or_none()
 
     if not conversation:
-        conversation = Conversation(user_id=user.id, model_name="deepseek-chat")
+        conversation = Conversation(user_id=user.id, model_name="glm-5.1-openai")
         db.add(conversation)
         await db.commit()
         await db.refresh(conversation)
 
-    # Save user message
     user_msg = Message(
         conversation_id=conversation.id,
         user_id=user.id,
@@ -54,53 +52,56 @@ async def chat(
     db.add(user_msg)
     await db.commit()
 
+    conversation_id = str(conversation.id)
+    user_id = str(user.id)
+
     async def event_stream():
-        try:
-            # Step 1: Search
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Searching...'})}\n\n"
-            search_results = await search_svc.search(req.query, str(user.id), collection_id=req.collection_id)
+        # Use a separate DB session for streaming operations
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as stream_db:
+            try:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Searching...'})}\n\n"
+                search_results = await search_svc.search(req.query, user_id, collection_id=req.collection_id)
 
-            # Step 2: Build context
-            context = search_svc.build_context(search_results)
-            citations = [
-                {"chunk_id": r["chunk_id"], "score": r["score"], "snippet": r["content"][:200]}
-                for r in search_results
-            ]
+                context = search_svc.build_context(search_results)
+                citations = [
+                    {"chunk_id": r["chunk_id"], "score": r["score"], "snippet": r["content"][:200]}
+                    for r in search_results
+                ]
 
-            # Step 3: Stream citations
-            yield f"data: {json.dumps({'type': 'citations', 'data': citations})}\n\n"
+                yield f"data: {json.dumps({'type': 'citations', 'data': citations})}\n\n"
 
-            # Step 4: Stream LLM response
-            full_answer = ""
-            async for token in llm_svc.stream_generate(req.query, context, history=req.history):
-                full_answer += token
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                full_answer = ""
+                async for token in llm_svc.stream_generate(req.query, context, history=req.history):
+                    full_answer += token
+                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-            # Step 5: Save assistant message
-            assistant_msg = Message(
-                conversation_id=conversation.id,
-                user_id=user.id,
-                role="assistant",
-                content=full_answer,
-                citations=citations,
-                model_name="deepseek-chat",
-            )
-            db.add(assistant_msg)
+                # Save assistant message in separate session
+                assistant_msg = Message(
+                    conversation_id=conversation.id,
+                    user_id=user.id,
+                    role="assistant",
+                    content=full_answer,
+                    citations=citations,
+                    model_name="glm-5.1-openai",
+                )
+                stream_db.add(assistant_msg)
 
-            # Update conversation
-            conversation.message_count += 2
-            from datetime import datetime
-            conversation.last_message_at = datetime.utcnow()
+                from datetime import datetime, timezone
+                await stream_db.execute(
+                    Conversation.__table__.update()
+                    .where(Conversation.id == conversation.id)
+                    .values(
+                        message_count=Conversation.message_count + 2,
+                        last_message_at=datetime.now(timezone.utc),
+                        title=req.query[:50] if conversation.message_count == 0 and not conversation.title else Conversation.title,
+                    )
+                )
+                await stream_db.commit()
 
-            # Auto-generate title from first message
-            if conversation.message_count == 2 and not conversation.title:
-                conversation.title = req.query[:50]
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id})}\n\n"
 
-            await db.commit()
-
-            yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conversation.id)})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -45,9 +45,9 @@ async def upload(
 
     # Create DB record
     doc = Document(
-        id=str(doc_id),
+        id=doc_id,
         user_id=user.id,
-        collection_id=str(collection_id) if collection_id else None,
+        collection_id=collection_id,
         title=file.filename or doc_id,
         source_type="upload",
         file_path=file_path,
@@ -60,10 +60,10 @@ async def upload(
     await db.commit()
     await db.refresh(doc)
 
-    # Process document synchronously (local mode, no Celery)
+    # Process document (async, same event loop)
     try:
-        from app.services.doc_processor import process_document_sync
-        process_document_sync(str(doc.id), str(user.id), db)
+        from app.services.doc_processor import process_document
+        await process_document(str(doc.id), str(user.id))
         await db.refresh(doc)
     except Exception as e:
         doc.processing_status = "failed"
