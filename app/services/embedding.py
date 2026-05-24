@@ -1,9 +1,10 @@
-"""Embedding service: local bge-m3 via sentence-transformers, with API fallback."""
+"""Embedding service: local bge-m3 with Redis cache, API fallback."""
 
 import hashlib
 import logging
 import numpy as np
 from app.config import get_settings
+from app.services.cache import get_cached_embedding, cache_embedding
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -53,35 +54,58 @@ def _is_placeholder(key: str) -> bool:
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed texts using local bge-m3, or fallback to API/dummy."""
+    """Embed texts: check Redis cache → local model → API → dummy."""
     if not texts:
         return []
 
-    # Try local model first
+    # Check cache for each text, collect misses
+    cached = {}
+    misses = []
+    for i, t in enumerate(texts):
+        vec = await get_cached_embedding(t)
+        if vec is not None:
+            cached[i] = vec
+        else:
+            misses.append((i, t))
+
+    results: list[list[float] | None] = [None] * len(texts)
+    for i, vec in cached.items():
+        results[i] = vec
+
+    if not misses:
+        return results  # type: ignore
+
+    # Embed misses
+    miss_texts = [t for _, t in misses]
+    miss_vectors = await _compute_embeddings(miss_texts)
+
+    # Cache and fill results
+    for (orig_idx, text), vec in zip(misses, miss_vectors):
+        results[orig_idx] = vec
+        await cache_embedding(text, vec)
+
+    return results  # type: ignore
+
+
+async def _compute_embeddings(texts: list[str]) -> list[list[float]]:
+    """Actual embedding computation without cache."""
     model = _load_model()
     if model is not None:
         embeddings = model.encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
         return embeddings.tolist()
 
-    # Fallback to API if key is configured
     if not _is_placeholder(settings.embedding_api_key):
         import httpx
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 settings.embedding_api_url,
                 headers={"Authorization": f"Bearer {settings.embedding_api_key}"},
-                json={
-                    "model": settings.embedding_model,
-                    "input": texts,
-                    "encoding_format": "float",
-                },
+                json={"model": settings.embedding_model, "input": texts, "encoding_format": "float"},
             )
             resp.raise_for_status()
             data = resp.json()
-        embeddings_data = sorted(data["data"], key=lambda x: x["index"])
-        return [e["embedding"] for e in embeddings_data]
+        return [e["embedding"] for e in sorted(data["data"], key=lambda x: x["index"])]
 
-    # Last resort: dummy
     return _dummy_embed(texts)
 
 
