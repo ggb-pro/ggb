@@ -1,6 +1,5 @@
 """Search service: vector search + context assembly."""
 
-import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
@@ -27,7 +26,6 @@ class SearchService:
         if not vector_results:
             return []
 
-        # Fetch full chunk content from DB
         chunk_ids = [r["chunk_id"] for r in vector_results]
         chunks_map = await self._fetch_chunks(chunk_ids, user_id)
 
@@ -58,16 +56,13 @@ class SearchService:
         return "\n\n".join(context_parts)
 
     async def _fetch_chunks(self, chunk_ids: list[str], user_id: str) -> dict:
-        engine = create_async_engine(settings.database_url, pool_size=2,
-                                     connect_args={"check_same_thread": False})
-        session_factory = async_sessionmaker(engine, class_=AsyncSession)
+        from app.deps import engine
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         chunks_map = {}
         async with session_factory() as db:
-            uuids = [str(cid) for cid in chunk_ids]
             result = await db.execute(
-                select(Chunk).where(Chunk.id.in_(uuids), Chunk.user_id == str(user_id))
+                select(Chunk).where(Chunk.id.in_(chunk_ids), Chunk.user_id == user_id)
             )
             for chunk in result.scalars().all():
                 chunks_map[str(chunk.id)] = chunk
-        await engine.dispose()
         return chunks_map

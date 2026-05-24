@@ -1,4 +1,4 @@
-"""LLM service: stream responses from DeepSeek API."""
+"""LLM service: stream responses via OpenAI-compatible API."""
 
 import json
 import httpx
@@ -30,20 +30,12 @@ class LLMService:
         """Stream tokens from LLM API via SSE."""
         messages = []
 
-        # Add history (last 3 turns)
         if history:
             for msg in history[-6:]:
                 messages.append({"role": msg.role, "content": msg.content})
 
         messages.append({"role": "user", "content": query})
         system = SYSTEM_PROMPT.format(context=context) if context else "你是一个知识库助手。"
-
-        # Fallback for local testing without real API key
-        if not settings.llm_api_key or settings.llm_api_key == "your-api-key-here":
-            answer = f"（本地测试模式，未配置 LLM API）\n\n基于参考信息的模拟回答：\n{context[:200]}..."
-            for char in answer:
-                yield char
-            return
 
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(
@@ -68,6 +60,8 @@ class LLMService:
                     try:
                         data = json.loads(data_str)
                         delta = data.get("choices", [{}])[0].get("delta", {})
+                        # glm-5.1 has reasoning_content (chain of thought)
+                        reasoning = delta.get("reasoning_content", "")
                         token = delta.get("content", "")
                         if token:
                             yield token

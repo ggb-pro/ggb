@@ -3,26 +3,32 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.19
 
-# Database (SQLite)
+# Database (PostgreSQL)
 sqlalchemy[asyncio]==2.0.36
-aiosqlite==0.20.0
+asyncpg==0.30.0
 
 # Auth
 python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
 
 # Document parsing
 pymupdf==1.25.1
 python-docx==1.1.2
 
-# HTTP client (embedding & LLM API)
+# HTTP client
 httpx==0.28.1
 
-# In-memory vector search
+# Vector store
+pymilvus>=2.4.0
 numpy>=2.0
+
+# Embedding (local bge-m3)
+sentence-transformers>=3.0.0
+
+# Redis cache
+redis>=5.0.0
 
 # Utils
 pydantic-settings==2.7.1
-pydantic==2.10.4
+pydantic[email]==2.10.4
 python-dotenv==1.0.1
