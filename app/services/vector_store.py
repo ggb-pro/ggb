@@ -37,8 +37,9 @@ class MilvusLiteStore:
             index_params.add_index(field_name="vector", index_type="IVF_FLAT",
                                    metric_type="COSINE", params={"nlist": 128})
             self.client.create_index(collection_name=COLLECTION_NAME, index_params=index_params)
-            self.client.load_collection(collection_name=COLLECTION_NAME)
             logger.info(f"Created Milvus collection: {COLLECTION_NAME}")
+
+        self.client.load_collection(collection_name=COLLECTION_NAME)
 
     def insert(self, chunk_ids: list[str], user_id: str, document_id: str,
                vectors: list[list[float]], snippets: list[str]):
