@@ -14,7 +14,7 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(100))
     avatar_url: Mapped[str | None] = mapped_column(String(500))
-    plan_type: Mapped[str] = mapped_column(String(20), default="free")
+    plan: Mapped[str] = mapped_column(String(20), default="free")
     storage_used: Mapped[int] = mapped_column(BigInteger, default=0)
     vector_count: Mapped[int] = mapped_column(Integer, default=0)
     question_count: Mapped[int] = mapped_column(Integer, default=0)

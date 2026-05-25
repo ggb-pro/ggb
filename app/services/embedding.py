@@ -2,9 +2,11 @@
 
 import hashlib
 import logging
+import time
 import numpy as np
 from app.config import get_settings
 from app.services.cache import get_cached_embedding, cache_embedding
+from app.services.metrics import embedding_api_duration, api_error_total
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -57,6 +59,7 @@ async def _api_embed(texts: list[str]) -> list[list[float]] | None:
     """Call OpenAI-compatible Embedding API."""
     if _is_placeholder(settings.embedding_api_url):
         return None
+    t0 = time.monotonic()
     try:
         import httpx
         async with httpx.AsyncClient(timeout=60) as client:
@@ -69,8 +72,11 @@ async def _api_embed(texts: list[str]) -> list[list[float]] | None:
             data = resp.json()
         return [e["embedding"] for e in sorted(data["data"], key=lambda x: x["index"])]
     except Exception as e:
+        api_error_total.labels(service="embedding").inc()
         logger.warning(f"Embedding API failed: {e}")
         return None
+    finally:
+        embedding_api_duration.observe(time.monotonic() - t0)
 
 
 def _local_embed(texts: list[str]) -> list[list[float]] | None:

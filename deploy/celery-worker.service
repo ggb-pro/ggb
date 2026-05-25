@@ -1,0 +1,20 @@
+[Unit]
+Description=knSpace Celery Worker
+After=network.target redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/knSpacePro
+Environment=PATH=/home/ubuntu/knSpacePro/venv/bin:/usr/bin:/bin
+Environment=HF_ENDPOINT=https://hf-mirror.com
+ExecStart=/home/ubuntu/knSpacePro/venv/bin/celery -A app.tasks.celery_app:celery_app worker --loglevel=info --concurrency=2 --without-heartbeat
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

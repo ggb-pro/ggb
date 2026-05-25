@@ -13,6 +13,9 @@ from app.utils.security import get_current_user
 from app.services.search import SearchService
 from app.services.llm import LLMService
 from app.services.multi_turn import resolve_query_with_history
+from app.services.guard import check_injection
+from app.services.cache import check_rate_limit
+from app.services.citation import validate_citations
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
@@ -25,6 +28,21 @@ async def chat(
 ):
     search_svc = SearchService()
     llm_svc = LLMService()
+
+    # Prompt injection check
+    is_safe, reason = check_injection(req.query)
+    if not is_safe:
+        return StreamingResponse(
+            iter([f"data: {json.dumps({'type': 'error', 'message': 'Input rejected'})}\n\n"]),
+            media_type="text/event-stream",
+        )
+
+    # Rate limit check
+    if not await check_rate_limit(str(user.id), limit=100, window=3600):
+        return StreamingResponse(
+            iter([f"data: {json.dumps({'type': 'error', 'message': 'Rate limit exceeded'})}\n\n"]),
+            media_type="text/event-stream",
+        )
 
     # Get or create conversation
     conversation = None
@@ -89,6 +107,7 @@ async def chat(
                     {"chunk_id": r["chunk_id"], "score": r["score"], "snippet": r["content"][:200]}
                     for r in search_results
                 ]
+                max_cite_idx = len(search_results)
 
                 yield f"data: {json.dumps({'type': 'citations', 'data': citations})}\n\n"
 
@@ -103,6 +122,7 @@ async def chat(
                     yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
                 # Save assistant message
+                full_answer = validate_citations(full_answer, max_cite_idx)
                 assistant_msg = Message(
                     conversation_id=conversation.id,
                     user_id=user.id,

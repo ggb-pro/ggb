@@ -1,3 +1,6 @@
+import logging
+import sys
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +11,22 @@ from app.models.base import Base
 from app.api import auth, documents, chat, collections, conversations, eval
 
 settings = get_settings()
+
+# JSON logging
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }, ensure_ascii=False)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logging.root.handlers[0].setFormatter(_JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
 
 
 @asynccontextmanager

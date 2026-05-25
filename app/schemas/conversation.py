@@ -23,7 +23,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     citations: list | None = None
-    token_count: int | None = None
+    token_usage: dict | None = None
     model_name: str | None = None
     created_at: datetime
 

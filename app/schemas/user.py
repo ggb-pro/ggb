@@ -32,7 +32,7 @@ class UserOut(BaseModel):
     id: uuid.UUID
     email: str
     display_name: str | None
-    plan_type: str
+    plan: str
     avatar_url: str | None
     settings: dict | None = None
 

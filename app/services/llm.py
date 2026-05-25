@@ -1,9 +1,11 @@
 """LLM service: stream responses via OpenAI-compatible API."""
 
 import json
+import time
 import httpx
 from app.config import get_settings
 from app.schemas.chat import ChatMessage
+from app.services.metrics import rag_llm_duration
 
 settings = get_settings()
 
@@ -28,6 +30,7 @@ class LLMService:
         history: list[ChatMessage] | None = None,
     ):
         """Stream tokens from LLM API via SSE."""
+        t0 = time.monotonic()
         messages = []
 
         if history:
@@ -56,6 +59,7 @@ class LLMService:
                         continue
                     data_str = line[6:]
                     if data_str.strip() == "[DONE]":
+                        rag_llm_duration.observe(time.monotonic() - t0)
                         break
                     try:
                         data = json.loads(data_str)

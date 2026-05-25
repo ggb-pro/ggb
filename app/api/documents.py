@@ -92,16 +92,17 @@ async def upload(
     await db.refresh(doc)
 
     try:
+        from app.tasks.document import process_document as celery_process
+        celery_process.delay(str(doc.id), str(user.id))
+    except Exception:
+        # Celery unavailable: process synchronously
         from app.services.doc_processor import process_document
         await process_document(str(doc.id), str(user.id))
         await db.refresh(doc)
-        user.storage_used = (user.storage_used or 0) + file_size
-        await db.commit()
-    except Exception as e:
-        doc.processing_status = "failed"
-        doc.processing_error = str(e)
-        await db.commit()
-        await db.refresh(doc)
+
+    user.storage_used = (user.storage_used or 0) + file_size
+    await db.commit()
+    await db.refresh(doc)
 
     return doc
 
@@ -283,13 +284,11 @@ async def import_url(
     await db.refresh(doc)
 
     try:
+        from app.tasks.document import process_document as celery_process
+        celery_process.delay(str(doc.id), str(user.id))
+    except Exception:
         from app.services.doc_processor import process_document
         await process_document(str(doc.id), str(user.id))
-        await db.refresh(doc)
-    except Exception as e:
-        doc.processing_status = "failed"
-        doc.processing_error = str(e)
-        await db.commit()
         await db.refresh(doc)
 
     return doc

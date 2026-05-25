@@ -1,6 +1,7 @@
 """Search service: hybrid search (vector + BM25) + RRF fusion + rerank + query understanding."""
 
 import logging
+import time
 from sqlalchemy import select, text, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -10,6 +11,7 @@ from app.models.chunk import Chunk
 from app.services.embedding import embed_query
 from app.services.vector_store import get_vector_store
 from app.services.query_analyzer import QueryAnalyzer
+from app.services.metrics import rag_retrieval_duration, rag_rerank_duration, rag_results_count
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -29,6 +31,16 @@ class SearchService:
         top_k: int = CANDIDATE_TOP_K,
         collection_id: str | None = None,
         history: list[str] | None = None,
+    ) -> list[dict]:
+        t0 = time.monotonic()
+        try:
+            return await self._do_search(query, user_id, top_k, collection_id, history)
+        finally:
+            rag_retrieval_duration.observe(time.monotonic() - t0)
+
+    async def _do_search(
+        self, query: str, user_id: str, top_k: int,
+        collection_id: str | None, history: list[str] | None,
     ) -> list[dict]:
         # Step 0: Query analysis
         analyzed = _analyzer.analyze(query, history=history)
@@ -72,7 +84,9 @@ class SearchService:
 
         # Step 3: Rerank
         reranked = await self._rerank(search_query, candidates)
-        return reranked[:RERANK_TOP_K]
+        result = reranked[:RERANK_TOP_K]
+        rag_results_count.observe(len(result))
+        return result
 
     async def _single_search(
         self, query: str, user_id: str, top_k: int,
@@ -144,24 +158,28 @@ class SearchService:
 
     async def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
         """Rerank candidates via API or local model."""
-        if len(candidates) <= 1:
+        t0 = time.monotonic()
+        try:
+            if len(candidates) <= 1:
+                return candidates
+
+            if settings.rerank_backend == "api":
+                result = await self._rerank_api(query, candidates)
+                if result is not None:
+                    return result
+                logger.info("API rerank failed, falling back to local")
+            else:
+                result = await self._rerank_local(query, candidates)
+                if result is not None:
+                    return result
+                logger.info("Local rerank failed, falling back to API")
+                result = await self._rerank_api(query, candidates)
+                if result is not None:
+                    return result
+
             return candidates
-
-        if settings.rerank_backend == "api":
-            result = await self._rerank_api(query, candidates)
-            if result is not None:
-                return result
-            logger.info("API rerank failed, falling back to local")
-        else:
-            result = await self._rerank_local(query, candidates)
-            if result is not None:
-                return result
-            logger.info("Local rerank failed, falling back to API")
-            result = await self._rerank_api(query, candidates)
-            if result is not None:
-                return result
-
-        return candidates
+        finally:
+            rag_rerank_duration.observe(time.monotonic() - t0)
 
     async def _rerank_api(self, query: str, candidates: list[dict]) -> list[dict] | None:
         """Rerank via Jina/Cohere-compatible API."""

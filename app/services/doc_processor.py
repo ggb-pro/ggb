@@ -84,5 +84,6 @@ async def process_document(doc_id: str, user_id: str):
         store.insert(chunk_ids, str(user_id), str(doc.id), all_vectors, texts)
 
         doc.processing_status = "ready"
+        doc.chunk_count = len(chunk_results)
         await db.commit()
         logger.info(f"Document processed: {doc_id}, {len(chunk_results)} chunks")
