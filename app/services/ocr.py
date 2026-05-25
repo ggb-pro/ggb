@@ -1,21 +1,25 @@
-"""OCR service: PaddleOCR wrapper for extracting text from images."""
+"""OCR service: API-first with local PaddleOCR fallback."""
 
+import base64
 import logging
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 _ocr_engine = None
 
 
-def get_ocr():
-    """Lazy-load PaddleOCR engine."""
+def _load_local_ocr():
+    """Lazy-load PaddleOCR engine (local fallback only)."""
     global _ocr_engine
     if _ocr_engine is not None:
         return _ocr_engine
     try:
         from paddleocr import PaddleOCR
         _ocr_engine = PaddleOCR(use_angle_cls=True, lang="ch", use_gpu=False, show_log=False)
-        logger.info("PaddleOCR loaded")
+        logger.info("PaddleOCR loaded (local fallback)")
         return _ocr_engine
     except ImportError:
         logger.warning("PaddleOCR not installed. Install: pip install paddlepaddle paddleocr")
@@ -25,26 +29,67 @@ def get_ocr():
         return None
 
 
-def ocr_image(image_path: str) -> str:
-    """Extract text from an image file using PaddleOCR.
+def _ocr_api(image_path: str) -> str | None:
+    """Call external OCR API."""
+    if not settings.ocr_api_url:
+        return None
+    try:
+        import httpx
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
 
-    Returns extracted text as a single string.
-    """
-    engine = get_ocr()
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                settings.ocr_api_url,
+                headers={
+                    "Authorization": f"Bearer {settings.ocr_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"image": img_b64},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data.get("text", "")
+    except Exception as e:
+        logger.warning(f"OCR API failed: {e}")
+        return None
+
+
+def _ocr_local(image_path: str) -> str | None:
+    """Local PaddleOCR inference."""
+    engine = _load_local_ocr()
     if engine is None:
-        return ""
-
+        return None
     try:
         result = engine.ocr(image_path, cls=True)
         if not result or not result[0]:
             return ""
-
-        lines = []
-        for line in result[0]:
-            text = line[1][0]
-            lines.append(text)
-
+        lines = [line[1][0] for line in result[0]]
         return "\n".join(lines)
     except Exception as e:
-        logger.warning(f"OCR failed for {image_path}: {e}")
-        return ""
+        logger.warning(f"Local OCR failed for {image_path}: {e}")
+        return None
+
+
+def ocr_image(image_path: str) -> str:
+    """Extract text from an image file.
+
+    Strategy: API → local → empty string.
+    """
+    if settings.ocr_backend == "api":
+        text = _ocr_api(image_path)
+        if text is not None:
+            return text
+        logger.info("OCR API failed, falling back to local")
+
+    text = _ocr_local(image_path)
+    if text is not None:
+        return text
+
+    # If API was primary and local failed, try API as last resort
+    if settings.ocr_backend == "local" and settings.ocr_api_url:
+        text = _ocr_api(image_path)
+        if text is not None:
+            return text
+
+    return ""

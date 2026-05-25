@@ -18,10 +18,22 @@ class Settings(BaseSettings):
     # Vector store (Milvus Lite file URI - named differently to avoid pymilvus auto-reading)
     vector_store_uri: str = "./milvus_data.db"
 
-    # Embedding (API fallback, primary is local bge-m3)
+    # Embedding
+    embedding_backend: str = "api"  # "api" | "local"
     embedding_api_url: str = ""
     embedding_api_key: str = ""
     embedding_model: str = "BAAI/bge-m3"
+
+    # Reranker
+    rerank_backend: str = "api"  # "api" | "local"
+    rerank_api_url: str = ""
+    rerank_api_key: str = ""
+    rerank_model: str = "jina-reranker-v2-base-multilingual"
+
+    # OCR
+    ocr_backend: str = "api"  # "api" | "local"
+    ocr_api_url: str = ""
+    ocr_api_key: str = ""
 
     # LLM
     llm_api_url: str = "http://1239mxgn96959.vicp.fun:4009/v1"

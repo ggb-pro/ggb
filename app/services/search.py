@@ -143,14 +143,67 @@ class SearchService:
             return []
 
     async def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
-        """Rerank candidates using bge-reranker or fallback to score-based."""
+        """Rerank candidates via API or local model."""
         if len(candidates) <= 1:
             return candidates
 
+        if settings.rerank_backend == "api":
+            result = await self._rerank_api(query, candidates)
+            if result is not None:
+                return result
+            logger.info("API rerank failed, falling back to local")
+        else:
+            result = await self._rerank_local(query, candidates)
+            if result is not None:
+                return result
+            logger.info("Local rerank failed, falling back to API")
+            result = await self._rerank_api(query, candidates)
+            if result is not None:
+                return result
+
+        return candidates
+
+    async def _rerank_api(self, query: str, candidates: list[dict]) -> list[dict] | None:
+        """Rerank via Jina/Cohere-compatible API."""
+        if not settings.rerank_api_url:
+            return None
+        try:
+            import httpx
+            documents = [c["content"] for c in candidates]
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    settings.rerank_api_url,
+                    headers={
+                        "Authorization": f"Bearer {settings.rerank_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": len(candidates),
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            for r in data.get("results", []):
+                idx = r["index"]
+                candidates[idx]["score"] = float(r["relevance_score"])
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            logger.info(f"Reranked {len(candidates)} candidates via API")
+            return candidates
+        except Exception as e:
+            logger.warning(f"Rerank API failed: {e}")
+            return None
+
+    async def _rerank_local(self, query: str, candidates: list[dict]) -> list[dict] | None:
+        """Rerank via local CrossEncoder model."""
         try:
             reranker = self._get_reranker()
             if reranker is None:
-                return candidates
+                return None
 
             pairs = [[query, c["content"]] for c in candidates]
             raw_scores = reranker.predict(pairs)
@@ -164,16 +217,16 @@ class SearchService:
                 candidates[i]["score"] = score
 
             candidates.sort(key=lambda x: x["score"], reverse=True)
-            logger.info(f"Reranked {len(candidates)} candidates")
+            logger.info(f"Reranked {len(candidates)} candidates via local model")
             return candidates
         except Exception as e:
-            logger.warning(f"Rerank failed: {e}")
-            return candidates
+            logger.warning(f"Local rerank failed: {e}")
+            return None
 
     _reranker_model = None
 
     def _get_reranker(self):
-        """Lazy-load bge-reranker model."""
+        """Lazy-load bge-reranker model (local fallback only)."""
         if self.__class__._reranker_model is not None:
             return self.__class__._reranker_model
         try:
@@ -181,7 +234,7 @@ class SearchService:
             if not os.environ.get("HF_ENDPOINT"):
                 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             from sentence_transformers import CrossEncoder
-            logger.info("Loading bge-reranker-v2-m3...")
+            logger.info("Loading bge-reranker-v2-m3 (local fallback)...")
             self.__class__._reranker_model = CrossEncoder(
                 "BAAI/bge-reranker-v2-m3",
                 device="cpu",
