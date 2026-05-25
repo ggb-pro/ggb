@@ -28,12 +28,13 @@ class Settings(BaseSettings):
     rerank_backend: str = "api"  # "api" | "local"
     rerank_api_url: str = ""
     rerank_api_key: str = ""
-    rerank_model: str = "jina-reranker-v2-base-multilingual"
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
 
     # OCR
     ocr_backend: str = "api"  # "api" | "local"
-    ocr_api_url: str = ""
+    ocr_api_url: str = "https://api.siliconflow.cn/v1"
     ocr_api_key: str = ""
+    ocr_model: str = "deepseek-ai/DeepSeek-OCR"
 
     # LLM
     llm_api_url: str = "http://1239mxgn96959.vicp.fun:4009/v1"

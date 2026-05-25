@@ -1,10 +1,10 @@
-"""Service factory: abstract interfaces + backend selection via config."""
+"""Service factory: Protocol interfaces + adapter classes + backend selection."""
 
 from __future__ import annotations
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, AsyncIterator
 
 
-# ── Vector Store ──────────────────────────────────────────────────────────
+# ── Protocol Definitions ──────────────────────────────────────────────────
 
 @runtime_checkable
 class VectorStoreBase(Protocol):
@@ -15,8 +15,6 @@ class VectorStoreBase(Protocol):
     async def delete_by_document(self, document_id: str): ...
 
 
-# ── Full-Text Search ─────────────────────────────────────────────────────
-
 @runtime_checkable
 class FullTextSearchBase(Protocol):
     async def search(self, query: str, user_id: str,
@@ -25,8 +23,6 @@ class FullTextSearchBase(Protocol):
     async def delete_chunk(self, chunk_id: str): ...
 
 
-# ── Object Storage ───────────────────────────────────────────────────────
-
 @runtime_checkable
 class ObjectStorageBase(Protocol):
     async def save(self, key: str, data: bytes) -> str: ...
@@ -34,14 +30,11 @@ class ObjectStorageBase(Protocol):
     async def delete(self, key: str): ...
 
 
-# ── Embedding ─────────────────────────────────────────────────────────────
-
 @runtime_checkable
 class EmbeddingServiceBase(Protocol):
     async def encode(self, texts: list[str]) -> list[list[float]]: ...
+    async def encode_query(self, query: str) -> list[float]: ...
 
-
-# ── Rerank ────────────────────────────────────────────────────────────────
 
 @runtime_checkable
 class RerankServiceBase(Protocol):
@@ -49,48 +42,111 @@ class RerankServiceBase(Protocol):
                      top_n: int) -> list[dict]: ...
 
 
-# ── OCR ───────────────────────────────────────────────────────────────────
-
 @runtime_checkable
 class OcrServiceBase(Protocol):
     def recognize(self, image_path: str) -> str: ...
 
 
-# ── LLM ───────────────────────────────────────────────────────────────────
-
 @runtime_checkable
 class LlmServiceBase(Protocol):
     async def stream_generate(self, query: str, context: str,
-                              history: list | None = None): ...
+                              history: list | None = None) -> AsyncIterator[str]: ...
 
 
-# ── Factory helpers ───────────────────────────────────────────────────────
+# ── Adapter Classes ────────────────────────────────────────────────────────
+
+class EmbeddingAdapter:
+    """Wraps embedding module to satisfy EmbeddingServiceBase protocol."""
+
+    async def encode(self, texts: list[str]) -> list[list[float]]:
+        from app.services.embedding import embed_texts
+        return await embed_texts(texts)
+
+    async def encode_query(self, query: str) -> list[float]:
+        from app.services.embedding import embed_query
+        return await embed_query(query)
+
+
+class RerankAdapter:
+    """Wraps rerank logic to satisfy RerankServiceBase protocol."""
+
+    async def rerank(self, query: str, documents: list[str],
+                     top_n: int = 10) -> list[dict]:
+        from app.config import get_settings
+        from app.services.metrics import rag_rerank_duration
+        import time
+        import httpx
+
+        settings = get_settings()
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    settings.rerank_api_url,
+                    headers={
+                        "Authorization": f"Bearer {settings.rerank_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            for r in data.get("results", []):
+                idx = r["index"]
+                results.append({
+                    "index": idx,
+                    "score": float(r["relevance_score"]),
+                    "text": documents[idx] if idx < len(documents) else "",
+                })
+            return results
+        finally:
+            rag_rerank_duration.observe(time.monotonic() - t0)
+
+
+class OcrAdapter:
+    """Wraps OCR module to satisfy OcrServiceBase protocol."""
+
+    def recognize(self, image_path: str) -> str:
+        from app.services.ocr import ocr_image
+        return ocr_image(image_path)
+
+
+class LlmAdapter:
+    """Wraps LLMService to satisfy LlmServiceBase protocol."""
+
+    async def stream_generate(self, query: str, context: str,
+                              history: list | None = None) -> AsyncIterator[str]:
+        from app.services.llm import LLMService
+        svc = LLMService()
+        async for token in svc.stream_generate(query, context, history):
+            yield token
+
+
+# ── Factory Functions ──────────────────────────────────────────────────────
 
 def get_vector_store():
-    """Get vector store instance (Milvus Lite or fallback)."""
     from app.services.vector_store import get_vector_store as _get
     return _get()
 
 
-def get_embedding_service() -> EmbeddingServiceBase:
-    """Get embedding service. All backends expose embed_texts / embed_query."""
-    from app.services import embedding as mod
-    return mod  # module-level functions satisfy the protocol
+def get_embedding_service() -> EmbeddingAdapter:
+    return EmbeddingAdapter()
 
 
-def get_rerank_service() -> RerankServiceBase:
-    """Get rerank service via SearchService._rerank."""
-    from app.services.search import SearchService
-    return SearchService()
+def get_rerank_service() -> RerankAdapter:
+    return RerankAdapter()
 
 
-def get_ocr_service() -> OcrServiceBase:
-    """Get OCR service."""
-    from app.services import ocr as mod
-    return mod  # module-level ocr_image satisfies the protocol
+def get_ocr_service() -> OcrAdapter:
+    return OcrAdapter()
 
 
-def get_llm_service() -> LlmServiceBase:
-    """Get LLM service."""
-    from app.services.llm import LLMService
-    return LLMService()
+def get_llm_service() -> LlmAdapter:
+    return LlmAdapter()
