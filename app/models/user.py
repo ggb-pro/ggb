@@ -1,15 +1,17 @@
 import uuid
-from sqlalchemy import String, Boolean, Integer, BigInteger
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy import JSON
+from sqlalchemy import String, Integer, BigInteger, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
+
+
+def _uuid():
+    return str(uuid.uuid4())
 
 
 class User(Base, TimestampMixin):
     __tablename__ = "users"
 
-    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(100))
@@ -19,5 +21,5 @@ class User(Base, TimestampMixin):
     vector_count: Mapped[int] = mapped_column(Integer, default=0)
     question_count: Mapped[int] = mapped_column(Integer, default=0)
     question_date = None
-    settings: Mapped[dict] = mapped_column(JSONB, default=dict)
+    settings: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="active")

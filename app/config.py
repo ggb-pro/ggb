@@ -15,8 +15,12 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
-    # Vector store (Milvus Lite file URI - named differently to avoid pymilvus auto-reading)
-    vector_store_uri: str = "./milvus_data.db"
+    # Vector store (Milvus Standalone gRPC URI)
+    milvus_uri: str = "http://localhost:19530"
+
+    # Elasticsearch
+    es_url: str = "http://localhost:9200"
+    es_index: str = "chunks"
 
     # Embedding
     embedding_backend: str = "api"  # "api" | "local"

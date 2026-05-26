@@ -91,20 +91,35 @@ async def upload(
     await db.commit()
     await db.refresh(doc)
 
-    try:
-        from app.tasks.document import process_document as celery_process
-        celery_process.delay(str(doc.id), str(user.id))
-    except Exception:
-        # Celery unavailable: process synchronously
-        from app.services.doc_processor import process_document
-        await process_document(str(doc.id), str(user.id))
-        await db.refresh(doc)
-
     user.storage_used = (user.storage_used or 0) + file_size
     await db.commit()
     await db.refresh(doc)
 
+    # Background processing (in-process asyncio — reliable with ES + Milvus)
+    asyncio.create_task(_bg_process(str(doc.id), str(user.id)))
+
     return doc
+
+
+async def _bg_process(doc_id: str, user_id: str):
+    """Background document processing when Celery is unavailable."""
+    try:
+        from app.services.doc_processor import process_document
+        await process_document(doc_id, user_id)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Background processing failed for doc {doc_id}: {e}")
+        # Mark document as failed
+        from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+        from app.deps import engine
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as db:
+            result = await db.execute(select(Document).where(Document.id == doc_id))
+            doc = result.scalar_one_or_none()
+            if doc:
+                doc.processing_status = "failed"
+                doc.processing_error = str(e)[:2000]
+                await db.commit()
 
 
 @router.get("", response_model=list[DocumentOut])
@@ -155,6 +170,13 @@ async def delete_doc(
     try:
         store = get_vector_store()
         store.delete_by_document(doc_id)
+    except Exception:
+        pass
+
+    # 1b. Clean up Elasticsearch
+    try:
+        from app.services.es import delete_by_document as es_delete
+        es_delete(doc_id)
     except Exception:
         pass
 
@@ -283,13 +305,7 @@ async def import_url(
     await db.commit()
     await db.refresh(doc)
 
-    try:
-        from app.tasks.document import process_document as celery_process
-        celery_process.delay(str(doc.id), str(user.id))
-    except Exception:
-        from app.services.doc_processor import process_document
-        await process_document(str(doc.id), str(user.id))
-        await db.refresh(doc)
+    asyncio.create_task(_bg_process(str(doc.id), str(user.id)))
 
     return doc
 
@@ -308,8 +324,8 @@ async def _clone_chunks_from_existing(
     # Clone chunks with new IDs pointing to target document
     old_to_new = {}
     for chunk in source_chunks:
-        new_id = uuid.uuid4()
-        old_to_new[str(chunk.id)] = str(new_id)
+        new_id = str(uuid.uuid4())
+        old_to_new[str(chunk.id)] = new_id
         db.add(Chunk(
             id=new_id,
             document_id=target_doc_id,

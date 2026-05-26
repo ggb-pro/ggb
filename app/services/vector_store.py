@@ -1,4 +1,4 @@
-"""Vector store: Milvus Lite with pickle fallback for single-server deployment."""
+"""Vector store: Milvus Standalone with pickle fallback."""
 
 import logging
 from app.config import get_settings
@@ -12,12 +12,12 @@ COLLECTION_NAME = "chunks"
 _store = None
 
 
-class MilvusLiteStore:
-    """Persistent vector store backed by Milvus Lite."""
+class MilvusStandaloneStore:
+    """Vector store backed by Milvus Standalone server."""
 
     def __init__(self):
         from pymilvus import MilvusClient, DataType
-        self.uri = settings.vector_store_uri
+        self.uri = settings.milvus_uri
         self.client = MilvusClient(uri=self.uri)
 
         if not self.client.has_collection(COLLECTION_NAME):
@@ -27,7 +27,7 @@ class MilvusLiteStore:
                 FieldSchema(name="user_id", dtype=DataType.VARCHAR, max_length=36, is_partition_key=True),
                 FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=36),
                 FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
-                FieldSchema(name="snippet", dtype=DataType.VARCHAR, max_length=2000),
+                FieldSchema(name="snippet", dtype=DataType.VARCHAR, max_length=8192),
             ])
             self.client.create_collection(
                 collection_name=COLLECTION_NAME,
@@ -48,7 +48,7 @@ class MilvusLiteStore:
             data.append({
                 "id": cid, "user_id": user_id,
                 "document_id": document_id,
-                "vector": vec, "snippet": snip[:2000],
+                "vector": vec, "snippet": snip.encode("utf-8")[:8000].decode("utf-8", errors="ignore"),
             })
         self.client.insert(collection_name=COLLECTION_NAME, data=data)
 
@@ -98,7 +98,7 @@ class PickleStore:
 
     def _path(self):
         import os
-        return os.path.join(os.path.dirname(settings.vector_store_uri), "vector_store.pkl")
+        return os.path.join(os.path.dirname(settings.milvus_uri.replace("http://", "")), "vector_store.pkl")
 
     def _save(self):
         path = self._path()
@@ -142,9 +142,9 @@ def get_vector_store():
     if _store is not None:
         return _store
     try:
-        _store = MilvusLiteStore()
-        logger.info("Using Milvus Lite vector store")
+        _store = MilvusStandaloneStore()
+        logger.info("Using Milvus Standalone vector store")
     except Exception as e:
-        logger.warning(f"Milvus Lite unavailable ({e}), using pickle store")
+        logger.warning(f"Milvus Standalone unavailable ({e}), using pickle store")
         _store = PickleStore()
     return _store

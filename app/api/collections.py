@@ -59,6 +59,110 @@ async def create_collection(
     return collection
 
 
+# --- Tags (must be before /{collection_id} routes) ---
+
+@router.get("/tags", response_model=list[TagOut], tags=["tags"])
+async def list_tags(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Tag).where(Tag.user_id == str(user.id)).order_by(Tag.name)
+    )
+    return result.scalars().all()
+
+
+@router.post("/tags", response_model=TagOut, tags=["tags"])
+async def create_tag(
+    data: TagCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    tag = Tag(user_id=str(user.id), name=data.name, color=data.color)
+    db.add(tag)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(409, "Tag already exists")
+    await db.refresh(tag)
+    return tag
+
+
+@router.delete("/tags/{tag_id}", tags=["tags"])
+async def delete_tag(
+    tag_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Tag).where(Tag.id == str(tag_id), Tag.user_id == str(user.id))
+    )
+    tag = result.scalar_one_or_none()
+    if not tag:
+        raise HTTPException(404, "Tag not found")
+    await db.delete(tag)
+    await db.commit()
+    return {"status": "deleted"}
+
+
+# --- Document Tags (before /{collection_id}) ---
+
+@router.post("/documents/{doc_id}/tags/{tag_id}", tags=["document-tags"])
+async def add_document_tag(
+    doc_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    doc = await db.execute(
+        select(Document).where(
+            Document.id == str(doc_id),
+            Document.user_id == str(user.id),
+            Document.is_deleted == False,
+        )
+    )
+    if not doc.scalar_one_or_none():
+        raise HTTPException(404, "Document not found")
+    tag = await db.execute(
+        select(Tag).where(Tag.id == str(tag_id), Tag.user_id == str(user.id))
+    )
+    if not tag.scalar_one_or_none():
+        raise HTTPException(404, "Tag not found")
+
+    dt = DocumentTag(document_id=str(doc_id), tag_id=str(tag_id))
+    db.add(dt)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(409, "Tag already applied")
+    return {"status": "added"}
+
+
+@router.delete("/documents/{doc_id}/tags/{tag_id}", tags=["document-tags"])
+async def remove_document_tag(
+    doc_id: uuid.UUID,
+    tag_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(DocumentTag).where(
+            DocumentTag.document_id == str(doc_id),
+            DocumentTag.tag_id == str(tag_id),
+        )
+    )
+    dt = result.scalar_one_or_none()
+    if not dt:
+        raise HTTPException(404, "Tag association not found")
+    await db.delete(dt)
+    await db.commit()
+    return {"status": "removed"}
+
+
+# --- Collection detail routes (after /tags, /documents) ---
+
 @router.get("/{collection_id}", response_model=CollectionOut)
 async def get_collection(
     collection_id: uuid.UUID,
@@ -143,106 +247,3 @@ async def list_collection_documents(
     ).order_by(Document.created_at.desc()).offset((page - 1) * size).limit(size)
     result = await db.execute(stmt)
     return result.scalars().all()
-
-
-# --- Tags ---
-
-@router.get("/tags", response_model=list[TagOut], tags=["tags"])
-async def list_tags(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Tag).where(Tag.user_id == str(user.id)).order_by(Tag.name)
-    )
-    return result.scalars().all()
-
-
-@router.post("/tags", response_model=TagOut, tags=["tags"])
-async def create_tag(
-    data: TagCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    tag = Tag(user_id=str(user.id), name=data.name, color=data.color)
-    db.add(tag)
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise HTTPException(409, "Tag already exists")
-    await db.refresh(tag)
-    return tag
-
-
-@router.delete("/tags/{tag_id}", tags=["tags"])
-async def delete_tag(
-    tag_id: uuid.UUID,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Tag).where(Tag.id == str(tag_id), Tag.user_id == str(user.id))
-    )
-    tag = result.scalar_one_or_none()
-    if not tag:
-        raise HTTPException(404, "Tag not found")
-    await db.delete(tag)
-    await db.commit()
-    return {"status": "deleted"}
-
-
-# --- Document Tags ---
-
-@router.post("/documents/{doc_id}/tags/{tag_id}", tags=["document-tags"])
-async def add_document_tag(
-    doc_id: uuid.UUID,
-    tag_id: uuid.UUID,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    # Verify ownership
-    doc = await db.execute(
-        select(Document).where(
-            Document.id == str(doc_id),
-            Document.user_id == str(user.id),
-            Document.is_deleted == False,
-        )
-    )
-    if not doc.scalar_one_or_none():
-        raise HTTPException(404, "Document not found")
-    tag = await db.execute(
-        select(Tag).where(Tag.id == str(tag_id), Tag.user_id == str(user.id))
-    )
-    if not tag.scalar_one_or_none():
-        raise HTTPException(404, "Tag not found")
-
-    dt = DocumentTag(document_id=str(doc_id), tag_id=str(tag_id))
-    db.add(dt)
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise HTTPException(409, "Tag already applied")
-    return {"status": "added"}
-
-
-@router.delete("/documents/{doc_id}/tags/{tag_id}", tags=["document-tags"])
-async def remove_document_tag(
-    doc_id: uuid.UUID,
-    tag_id: uuid.UUID,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(DocumentTag).where(
-            DocumentTag.document_id == str(doc_id),
-            DocumentTag.tag_id == str(tag_id),
-        )
-    )
-    dt = result.scalar_one_or_none()
-    if not dt:
-        raise HTTPException(404, "Tag association not found")
-    await db.delete(dt)
-    await db.commit()
-    return {"status": "removed"}

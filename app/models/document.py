@@ -1,19 +1,19 @@
 import uuid
-from sqlalchemy import String, Boolean, Integer, BigInteger, Text, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import String, Boolean, Integer, BigInteger, Text, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
+from app.models.user import _uuid
 
 
 class Document(Base, TimestampMixin):
     __tablename__ = "documents"
 
-    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True,
+        String(36), ForeignKey("users.id"), nullable=False, index=True,
     )
     collection_id: Mapped[str | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("collections.id"),
+        String(36), ForeignKey("collections.id"),
     )
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     source_type: Mapped[str] = mapped_column(String(20), default="upload")
@@ -28,5 +28,5 @@ class Document(Base, TimestampMixin):
     processing_error: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
-    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)

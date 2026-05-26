@@ -132,28 +132,41 @@ class SearchService:
         return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
 
     async def _bm25_search(self, query: str, user_id: str, top_k: int) -> list[dict]:
-        """Full-text search using PostgreSQL ts_vector."""
+        """Full-text search via Elasticsearch with jieba Chinese tokenization."""
+        try:
+            from app.services.es import search as es_search
+            return es_search(query, user_id, top_k)
+        except Exception as e:
+            logger.warning(f"ES search failed, falling back to PG FTS: {e}")
+            return await self._pg_fts_search(query, user_id, top_k)
+
+    async def _pg_fts_search(self, query: str, user_id: str, top_k: int) -> list[dict]:
+        """Fallback: PostgreSQL FTS with jieba tokenization."""
+        from app.services.tokenizer import tokenize_query
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         try:
+            tokens = tokenize_query(query)
+            if not tokens.strip():
+                return []
             async with session_factory() as db:
                 sql = text("""
                     SELECT c.id::text as chunk_id,
                            c.document_id::text as document_id,
-                           ts_rank_cd(c.fts_vector, plainto_tsquery('simple', :query)) as score
+                           ts_rank_cd(c.fts_vector, to_tsquery('simple', :tokens)) as score
                     FROM chunks c
                     WHERE c.user_id::text = :user_id
-                      AND c.fts_vector @@ plainto_tsquery('simple', :query)
+                      AND c.fts_vector @@ to_tsquery('simple', :tokens)
                     ORDER BY score DESC
                     LIMIT :limit
                 """)
-                result = await db.execute(sql, {"query": query, "user_id": user_id, "limit": top_k})
+                result = await db.execute(sql, {"tokens": tokens, "user_id": user_id, "limit": top_k})
                 rows = result.fetchall()
                 return [
                     {"chunk_id": row[0], "document_id": row[1], "score": float(row[2])}
                     for row in rows
                 ]
-        except Exception as e:
-            logger.warning(f"BM25 search failed: {e}")
+        except Exception as e2:
+            logger.warning(f"PG FTS search also failed: {e2}")
             return []
 
     async def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:

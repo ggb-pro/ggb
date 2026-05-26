@@ -75,6 +75,9 @@ async def chat(
     user_id = str(user.id)
 
     async def event_stream():
+        # Always send conversation_id first so frontend can track it
+        yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as stream_db:
             try:

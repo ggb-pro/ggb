@@ -3,7 +3,7 @@
 import uuid
 import asyncio
 import logging
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.document import Document
@@ -52,15 +52,15 @@ async def process_document(doc_id: str, user_id: str):
                     page_map[c.content] = s.page_number
 
         for i, cr in enumerate(chunk_results):
-            cid = uuid.uuid4()
-            chunk_ids.append(str(cid))
+            cid = str(uuid.uuid4())
+            chunk_ids.append(cid)
             # Find parent_chunk_id
             parent_id = None
             if cr.parent_index is not None and cr.parent_index != i:
                 parent_id = chunk_ids[cr.parent_index] if cr.parent_index < len(chunk_ids) else None
 
             db.add(Chunk(
-                id=cid, document_id=doc.id, user_id=doc.user_id,
+                id=cid, document_id=str(doc.id), user_id=str(doc.user_id),
                 content=cr.content, chunk_index=i, chunk_type=cr.chunk_type,
                 parent_chunk_id=parent_id,
                 char_start=cr.char_start, char_end=cr.char_end,
@@ -69,6 +69,28 @@ async def process_document(doc_id: str, user_id: str):
             ))
         await db.commit()
         logger.info(f"Committed {len(chunk_results)} chunks to DB")
+
+        # Index chunks into Elasticsearch for full-text search
+        try:
+            from app.services.es import bulk_index_chunks
+            es_chunks = [
+                {"chunk_id": chunk_ids[i], "document_id": str(doc.id),
+                 "user_id": str(doc.user_id), "content": cr.content}
+                for i, cr in enumerate(chunk_results)
+            ]
+            bulk_index_chunks(es_chunks)
+        except Exception as e:
+            logger.warning(f"ES indexing failed, falling back to PG FTS: {e}")
+            from app.services.tokenizer import tokenize
+            for i, cr in enumerate(chunk_results):
+                tokens = tokenize(cr.content)
+                if tokens.strip():
+                    await db.execute(
+                        text("UPDATE chunks SET fts_vector = to_tsvector('simple', :tokens) WHERE id::text = :cid"),
+                        {"tokens": tokens, "cid": chunk_ids[i]},
+                    )
+            await db.commit()
+            logger.info(f"Updated PG FTS vectors for {len(chunk_results)} chunks")
 
         # Embed all chunks (parents + children)
         doc.processing_status = "embedding"

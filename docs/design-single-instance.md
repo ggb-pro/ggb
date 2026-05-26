@@ -53,7 +53,7 @@ knSpace 是一个私有化部署的 RAG 知识库系统，核心能力：
 |------|---------|---------|-----------|
 | bge-m3（embedding） | ~2.5 GB | ~200ms/批 | ~¥0.2 |
 | bge-reranker-v2-m3 | ~1.2 GB | ~300ms | ~¥7.5 |
-| PaddleOCR | ~1.5 GB | ~1s/页 | ~¥5 |
+| PaddleOCR (SiliconFlow Vision API) | 0 GB | ~1s/页 | ~¥5 |
 | LLM（glm-5.1） | N/A | ~2s 首 token | ~¥30 |
 | **合计** | **~5.2 GB（跑不了）** | | **~¥43/月** |
 
@@ -138,15 +138,15 @@ LLM 生成                   LLM 生成                    LLM 生成
               ┌────────────┘       └────────────┐
               │                                  │
        ┌──────▼──────┐                   ┌──────▼──────┐
-       │ PostgreSQL  │                   │  Milvus Lite │
+       │ PostgreSQL  │                   │  Milvus Standalone │
        │ users/docs/ │                   │  向量存储     │
-       │ chunks/fts  │                   │  (嵌入式)     │
+       │ chunks      │                   │  (Docker)     │
        │ convs/tags  │                   └─────────────┘
        │ memories    │
        └─────────────┘
               │
        ┌──────▼──────┐
-       │   Redis     │ 缓存 + Celery broker + 记忆缓存
+       │   Redis     │ embedding 缓存 + 限流
        └─────────────┘
 
        ┌──────▼──────┐
@@ -167,10 +167,10 @@ LLM 生成                   LLM 生成                    LLM 生成
 APISIX API Gateway           →   Nginx
 Kubernetes                   →   systemd
 12 个微服务（gRPC）            →   单 FastAPI（模块化）
-Kafka 异步流水线              →   Celery + Redis
+Kafka 异步流水线              →   asyncio.create_task
 PostgreSQL + Citus（分片）     →   单 PostgreSQL
-Milvus Cluster（HNSW）        →   Milvus Lite（IVF_FLAT）
-Elasticsearch（ik 分词）       →   PostgreSQL FTS（jieba 分词）
+Milvus Cluster（HNSW）        →   Milvus Standalone（IVF_FLAT）
+Elasticsearch（ik 分词）       →   Elasticsearch（jieba 分词）
 Redis Cluster                →   单 Redis
 MinIO / S3                   →   本地文件系统
 GPU 自建推理服务               →   云端 API
@@ -195,7 +195,7 @@ from typing import Protocol, AsyncIterator, Callable, runtime_checkable
 
 @runtime_checkable
 class VectorStoreBase(Protocol):
-    """向量存储 — 单实例: Milvus Lite / 百万版: Milvus Cluster"""
+    """向量存储 — 单实例: Milvus Standalone / 百万版: Milvus Cluster"""
     async def upsert(self, chunk_ids: list[str], user_id: str,
                      document_id: str, vectors: list[list[float]],
                      snippets: list[str]): ...
@@ -206,7 +206,7 @@ class VectorStoreBase(Protocol):
 
 @runtime_checkable
 class FullTextSearchBase(Protocol):
-    """全文检索 — 单实例: PG FTS (jieba) / 百万版: Elasticsearch (ik)"""
+    """全文检索 — 单实例: ES (jieba) / 百万版: Elasticsearch (ik)"""
     async def search(self, query: str, user_id: str,
                      top_k: int) -> list[dict]: ...
     async def index_chunk(self, chunk_id: str, content: str,
@@ -233,14 +233,14 @@ class EmbeddingServiceBase(Protocol):
 
 @runtime_checkable
 class RerankServiceBase(Protocol):
-    """重排序 — 单实例: Jina API / 百万版: GPU 自建"""
+    """重排序 — 单实例: SiliconFlow Rerank API / 百万版: GPU 自建"""
     async def rerank(self, query: str, documents: list[str],
                      top_n: int) -> list[dict]: ...
 
 
 @runtime_checkable
 class OcrServiceBase(Protocol):
-    """OCR — 单实例: 腾讯云 API / 百万版: 自建 PaddleOCR"""
+    """OCR — 单实例: SiliconFlow Vision API (DeepSeek-OCR) / 百万版: GPU 自建"""
     def recognize(self, image_path: str) -> str: ...
 
 
@@ -300,6 +300,9 @@ CREATE TABLE users (
     settings        JSONB DEFAULT '{}',
     storage_used    BIGINT DEFAULT 0,
     vector_count    INT DEFAULT 0,
+    question_count  INT DEFAULT 0,
+    question_date   DATE,                   -- 限流：每日提问计数用日期
+    status          VARCHAR(20) DEFAULT 'active',
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -310,7 +313,9 @@ CREATE TABLE collections (
     user_id     UUID NOT NULL REFERENCES users(id),
     parent_id   UUID REFERENCES collections(id),
     name        VARCHAR(200) NOT NULL,
+    description TEXT,
     icon        VARCHAR(50),
+    type        VARCHAR(20) DEFAULT 'folder',
     sort_order  INT DEFAULT 0,
     is_deleted  BOOLEAN DEFAULT FALSE,
     created_at  TIMESTAMPTZ DEFAULT now(),
@@ -333,6 +338,8 @@ CREATE TABLE documents (
     processing_error  TEXT,
     chunk_count       INT DEFAULT 0,
     page_count        INT,
+    word_count        INT,
+    language          VARCHAR(10) DEFAULT 'zh',
     metadata          JSONB DEFAULT '{}',
     is_deleted        BOOLEAN DEFAULT FALSE,
     created_at        TIMESTAMPTZ DEFAULT now(),
@@ -355,10 +362,7 @@ CREATE TABLE chunks (
     char_end        INT,
     page_number     INT,
     token_count     INT,
-    fts_tokens      TEXT,            -- jieba 分词结果（空格分隔）
-    fts             TSVECTOR GENERATED ALWAYS AS (
-                        to_tsvector('simple', COALESCE(fts_tokens, ''))
-                    ) STORED,
+    metadata        JSONB DEFAULT '{}',    -- 灵活元数据（扩展字段）
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -434,8 +438,8 @@ CREATE INDEX idx_messages_conversation
 CREATE INDEX idx_chunks_document_user
     ON chunks(document_id, user_id);
 
--- FTS 索引
-CREATE INDEX idx_chunks_fts ON chunks USING GIN(fts);
+-- FTS 索引（PG FTS fallback，ES 为主）
+CREATE INDEX idx_chunks_fts ON chunks USING GIN(fts_vector);
 
 -- 记忆索引
 CREATE INDEX idx_user_memories_user ON user_memories(user_id);
@@ -456,13 +460,13 @@ CREATE INDEX idx_user_memories_value ON user_memories USING GIN(value jsonb_path
      ├── 1. 保存到本地文件系统
      ├── 2. 创建 Document（status=pending）
      ├── 3. content_hash 去重（用户内，不暴露跨用户信息，见 §13.3）
-     ├── 4. Celery 异步任务：process_document
+     ├── 4. asyncio.create_task：process_document（进程内异步）
      │     ├── [Hook: pre_parse]  格式检测
      │     ├── 解析（PyMuPDF / python-docx / OCR API）
      │     ├── [Hook: post_parse] 去重检查、质量校验
      │     ├── 结构化分块（512 token, overlap=64）
      │     ├── [Hook: post_chunk] 分块质量检查
-     │     ├── jieba 分词 → 写入 fts_tokens 列
+     │     ├── ES bulk_index（jieba 分词，失败 fallback PG fts_vector）
      │     ├── Embedding API 批量向量化 → Milvus 写入
      │     ├── 写入 chunks 表
      │     ├── [Hook: post_embed] 索引一致性校验
@@ -483,9 +487,9 @@ CREATE INDEX idx_user_memories_value ON user_memories USING GIN(value jsonb_path
 | 解析 | ~3s | PyMuPDF 提取文本 |
 | 分块 + jieba 分词 | ~1s | 纯 CPU 计算 |
 | 向量化（100 chunks，batch=64） | ~5s | 2 次 API 调用 |
-| Milvus 写入 | ~2s | 嵌入式引擎 |
-| PG 写入 | ~1s | 含 FTS 索引更新 |
-| **总计** | **~12s** | |
+| Milvus 写入 | ~2s | Standalone gRPC |
+| ES 写入 | ~1s | bulk index + PG 写入 |
+| **总计** | **~12s** | ES bulk index 与 Milvus 写入并行 |
 
 ### 7.3 Hook 系统
 
@@ -571,62 +575,82 @@ async def chunk_quality_hook(ctx: HookContext) -> HookContext:
 PostgreSQL 的 `simple` 分词器对中文完全无效（中文没有空格），
 导致混合检索中的 FTS 分支形同虚设，检索质量退化为纯向量检索。
 
-### 8.1 方案：应用层 jieba 分词 + PG FTS
+### 8.1 方案：Elasticsearch + jieba 分词（PG FTS fallback）
 
-**为什么不用 zhparser 扩展**：需要编译安装 C 扩展，需要 root 权限，
-在腾讯云轻量服务器上可能有兼容性问题。
-jieba 是纯 Python，零依赖，写入和查询使用同一套分词器，保证一致性。
+**主方案**：Elasticsearch + jieba 应用层分词。文档处理时对 chunk 内容做 jieba 分词，
+将原始文本和分词结果分别存入 ES 的 `content` 和 `content_jieba` 字段，
+查询时同时匹配两个字段提升召回率。
+
+**Fallback**：ES 不可用时退化为 PG FTS（应用层 jieba 分词写入 `fts_vector` 列）。
+保留 PG FTS 作为兜底保证系统可用性。
 
 ```python
-# app/services/chunking.py — 分块时同步分词
+# app/services/es.py — ES 全文检索服务
 
-import jieba
+def bulk_index_chunks(chunks: list[dict]):
+    # 对每个 chunk 做 jieba 分词后写入 ES
+    from app.services.tokenizer import tokenize
+    _ensure_index()
+    es = _get_es()
+    actions = []
+    for chunk in chunks:
+        tokens = tokenize(chunk["content"])
+        actions.append({"index": {"_index": settings.es_index,
+                                   "_id": chunk["chunk_id"]}})
+        actions.append({
+            "chunk_id": chunk["chunk_id"],
+            "document_id": chunk["document_id"],
+            "user_id": chunk["user_id"],
+            "content": chunk["content"],
+            "content_jieba": tokens,
+        })
+    if actions:
+        es.bulk(body=actions, refresh=True)
 
-
-def tokenize_for_fts(text: str) -> str:
-    """中文分词，返回空格分隔的 token 字符串。
-
-    写入 chunks.fts_tokens 列，PG 的 GENERATED ALWAYS AS
-    to_tsvector('simple', fts_tokens) 会自动建 tsvector。
-
-    'simple' 配置按空格切词 → 正好和 jieba 输出格式匹配。
-    """
-    tokens = jieba.lcut_for_search(text)
-    # 过滤停用词和单字（单字太短，噪音大）
-    filtered = [t for t in tokens if len(t) >= 2]
-    return " ".join(filtered)
+def search(query: str, user_id: str, top_k: int = 40) -> list[dict]:
+    # 同时匹配 content_jieba（jieba 分词）和 content（原始）
+    tokens = tokenize_query(query)
+    body = {
+        "query": {
+            "bool": {
+                "must": {"term": {"user_id": user_id}},
+                "should": [
+                    {"match": {"content_jieba": {"query": tokens,
+                                                  "operator": "or"}}},
+                    {"match": {"content": {"query": query,
+                                            "operator": "or"}}},
+                ],
+                "minimum_should_match": 1,
+            },
+        },
+    }
+    resp = es.search(index=settings.es_index, body=body, size=top_k)
+    ...
 ```
 
 ```python
-# app/services/search.py — 查询时分词
+# app/services/search.py — 查询时的 fallback 链
 
-async def _bm25_search(self, query: str, user_id: str, top_k: int) -> list[dict]:
-    """FTS 搜索：查询端也用 jieba 分词，保证和写入一致。"""
-    tokens = tokenize_for_fts(query)
-    if not tokens.strip():
-        return []
-
-    sql = text("""
-        SELECT c.id::text AS chunk_id,
-               c.document_id::text AS document_id,
-               ts_rank_cd(c.fts, plainto_tsquery('simple', :tokens)) AS score
-        FROM chunks c
-        WHERE c.user_id::text = :user_id
-          AND c.fts @@ plainto_tsquery('simple', :tokens)
-        ORDER BY score DESC
-        LIMIT :limit
-    """)
-    async with session_factory() as db:
-        result = await db.execute(sql, {"tokens": tokens,
-                                        "user_id": user_id, "limit": top_k})
-        return [{"chunk_id": r[0], "document_id": r[1], "score": float(r[2])}
-                for r in result.fetchall()]
+async def _bm25_search(self, query, user_id, top_k):
+    # ES 优先，PG FTS fallback
+    try:
+        from app.services.es import search as es_search
+        return es_search(query, user_id, top_k)
+    except Exception as e:
+        logger.warning(f"ES search failed, falling back to PG FTS: {e}")
+        return await self._pg_fts_search(query, user_id, top_k)
 ```
+
+**为什么不用 ES 内置的 ik 分词**：ik 分词词典以中文通用语料为主，
+对专业术语的切分不如 jieba 灵活（jieba 支持用户自定义词典）。
+且 jieba 是纯 Python，写入和查询使用同一套分词器，保证一致性。
+未来百万版迁移到 ik 分词时需做分词一致性验证。
 
 **面试亮点**：
 1. 发现 `simple` 分词器对中文失效是个真实 bug，不是设计选择
-2. 选择应用层 jieba 而非 PG 扩展，是因为部署约束下的务实选择
-3. 写入和查询必须使用同一套分词器，否则 token 不匹配
+2. ES + jieba 应用层分词：控制分词一致性，支持自定义词典
+3. 双层 fallback：ES 不可用 → PG FTS，保证系统可用性
+4. 写入和查询必须使用同一套分词器，否则 token 不匹配
 
 ---
 
@@ -1310,13 +1334,13 @@ agent_trace_total = Counter("agent_trace_total", "Agent 执行总次数")
 |------|----------|------|
 | OS + 系统服务 | 500 MB | 含腾讯云监控 |
 | PostgreSQL 16 | 300 MB | shared_buffers=128MB |
-| Redis | 50 MB | 缓存 + broker + 记忆 |
+| Redis | 50 MB | embedding 缓存 + 限流 |
 | Nginx | 20 MB | 反向代理 |
 | FastAPI | 200 MB | 含 Agent + Tool 代码 |
-| Milvus Lite | 200 MB | 嵌入式向量引擎 |
-| Celery worker | 100 MB | 异步文档处理 |
-| **常驻合计** | **~1.4 GB** | |
-| **剩余** | **~2.2 GB** | 连接池 + 请求缓冲 + 数据增长 |
+| Milvus Standalone (Docker) | 200 MB | 向量引擎，IVF_FLAT 索引 |
+| Elasticsearch 8.x (Docker) | 300 MB | 全文检索引擎 |
+| **常驻合计** | **~1.6 GB** | |
+| **剩余** | **~2.0 GB** | 连接池 + 请求缓冲 + 数据增长 |
 
 ---
 
@@ -1341,9 +1365,19 @@ EMBEDDING_MODEL=BAAI/bge-m3
 
 # Rerank API
 RERANK_BACKEND=api
-RERANK_API_URL=https://api.jina.ai/v1/rerank
-RERANK_API_KEY=jina_xxx
-RERANK_MODEL=jina-reranker-v2-base-multilingual
+RERANK_API_URL=https://api.siliconflow.cn/v1/rerank
+RERANK_API_KEY=sk-xxx
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+
+# OCR API
+OCR_BACKEND=api
+OCR_API_URL=https://api.siliconflow.cn/v1
+OCR_API_KEY=sk-xxx
+OCR_MODEL=deepseek-ai/DeepSeek-OCR
+
+# Elasticsearch
+ES_URL=http://localhost:9200
+ES_INDEX=chunks
 
 # LLM API（必须使用 HTTPS）
 LLM_API_URL=https://your-llm-host/v1
@@ -1359,7 +1393,7 @@ AGENT_LATENCY_BUDGET_MS=5000
 FILE_STORAGE_PATH=/data/knspace/files
 
 # Vector Store
-VECTOR_STORE_URI=./milvus_data.db
+MILVUS_URI=http://localhost:19530
 ```
 
 ### 16.2 systemd
@@ -1394,9 +1428,9 @@ WantedBy=multi-user.target
 | AI 服务（Embed/Rerank/OCR/LLM） | 改 URL | **低** | 0.5 天 | 接口签名不变 |
 | Redis 单机 → Cluster | 改连接串 | **低** | 0.5 天 | 驱动透明支持 |
 | 本地 FS → MinIO/S3 | 新增实现类 | **低** | 1 天 | ObjectStorageBase 已抽象 |
-| Milvus Lite → Cluster | bulk export + import | **中** | 2-3 天 | 无官方迁移工具，需自建 |
-| PG FTS → Elasticsearch | 重建索引 + 调分词 | **中** | 2-3 天 | jieba → ik 分词，需验证一致性 |
-| Celery → Kafka | 任务模型差异大 | **中** | 3-5 天 | Task → Event 语义转换 |
+| Milvus Standalone → Cluster | 修改连接配置 | **低** | 0.5 天 | 同为 Milvus 协议，只需改 URI |
+| PG FTS → ES（已完成） | 已完成 | **-** | - | 单实例已用 ES + jieba，百万版迁移 jieba → ik |
+| asyncio → Kafka | 任务模型差异大 | **中** | 3-5 天 | create_task → Event 语义转换 |
 | **单 PG → Citus 分片** | **分片键 + co-location + 跨分片查询** | **高** | 5-10 天 | **非"加路由层"这么简单** |
 | systemd → K8s | Dockerfile + manifests | **中** | 2-3 天 | 标准化 |
 
@@ -1437,7 +1471,7 @@ WantedBy=multi-user.target
 - [ ] 表结构字段名与百万版一致
 - [ ] UUID 主键
 - [ ] JSONB 灵活元数据
-- [ ] jieba 分词写入 fts_tokens（迁移 ES 时作为对照）
+- [ ] jieba 分词写入 ES content_jieba 字段（百万版迁移 ik 时作为对照）
 
 **AI 服务层**：
 - [ ] Embedding 向量维度 1024 与 bge-m3 一致

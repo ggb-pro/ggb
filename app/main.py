@@ -1,9 +1,12 @@
 import logging
+import os
 import sys
 import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
 
 from app.config import get_settings
 from app.deps import engine
@@ -70,3 +73,14 @@ app.include_router(eval.router)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# Serve Vue frontend (SPA fallback: serve index.html for all non-API/non-file paths)
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static_dir):
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        file_path = os.path.join(_static_dir, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(_static_dir, "index.html"))
