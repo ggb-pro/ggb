@@ -23,7 +23,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 - 跨用户文档去重：相同文件只处理一次，其他用户克隆 chunk
 - **Agent 编排（v2.0）**：LangGraph 状态图驱动，意图分类→规划→工具执行→生成→反思闭环
 - **混合路由（v2.0）**：规则引擎分流，keyword/单轮 semantic → simple 走 v1.x，compare/multi_hop → complex 走 Agent
-- **降级机制（v2.0）**：系统过载时降级到 v1.x；SSE 流内运行时故障目前无法回退（待优化）
+- **降级机制（v2.0）**：系统过载 / Agent 超时(60s) / 运行时异常均可降级到 v1.x，SSE 流内降级带用户提示
 
 ### 1.3 技术栈
 
@@ -51,7 +51,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 
 4 核 AMD EPYC 7K62 / 4 GB 内存 / 40 GB SSD / 腾讯云轻量 4Mbps
 
-全部 AI 模型走云端 API（需配置 `rerank_allow_local=false` 禁止本地模型加载，否则 bge-reranker-v2-m3 会占 400-600MB）。LangGraph Runtime 为纯编排层 Python 对象，实际内存未做 profiling 验证。月成本约 43 元（API）+ 100 元（服务器），Agent 路径成本增量尚无线上数据验证。
+全部 AI 模型走云端 API，本地 reranker 已移除（防止 4G 机器 OOM）。LangGraph Runtime 为纯编排层 Python 对象。月成本约 43 元（API）+ 100 元（服务器），Agent 路径成本增量尚无线上数据验证。
 
 ---
 
@@ -194,9 +194,8 @@ app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
 | FastAPI + 业务代码 | 200 MB | 含所有业务代码 |
 | Redis | 60 MB | 缓存 + 限流 + Agent 热状态 |
 | Nginx | 20 MB | 反向代理 |
-| **LangGraph Runtime** | **<30 MB** | 纯编排层（理论值，未做 profiling 验证） |
-| **本地 Reranker fallback** | **400-600 MB** | bge-reranker-v2-m3，需配置禁用 |
-| **常驻合计** | **~2.2 GB**（不含本地 Reranker） | |
+| **LangGraph Runtime** | **<30 MB** | 纯编排层 |
+| **常驻合计** | **~2.2 GB** | |
 | **剩余可用** | **~1.8 GB** | 连接池 + 请求缓冲 |
 
 ---
@@ -717,11 +716,11 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 | Embedding | `services/embedding.py` | 文本→1024维向量 (BAAI/bge-m3) | Redis缓存 → SiliconFlow API → Local model → Dummy(零向量) |
 | VectorStore | `services/vector_store.py` | Milvus 向量存储 + COSINE 检索 | Milvus → 内存暴力搜索 |
 | ES | `services/es.py` | Elasticsearch 全文检索 + jieba 分词 + bulk 索引 | ES → PG FTS (to_tsvector) |
-| Search | `services/search.py` | 混合检索编排：查询分析→双通道→RRF融合→Rerank→fetch chunks | 向量/全文任一失败仍可用单通道 |
+| Search | `services/search.py` | 混合检索编排：查询分析→双通道→RRF融合→Rerank→fetch chunks。新增 `search_with_weights()` 供 Agent 工具层复用 | 向量/全文任一失败仍可用单通道 |
 | QueryAnalyzer | `services/query_analyzer.py` | 纯规则查询分类(keyword/semantic/compare/multi_hop) + 改写 + 子查询拆分 | — |
 | MultiTurn | `services/multi_turn.py` | 规则指代消解（"它/这个"→历史实体）+ LLM 上下文拼接 | 规则失败→原文透传 |
 | LLM | `services/llm.py` | OpenAI 兼容 SSE 流式生成 | API → 本地模型(预留) |
-| Rerank | `factory.py:RerankAdapter` | 精排重排序 | SiliconFlow API → Local CrossEncoder → 不排序 |
+| Rerank | `factory.py:RerankAdapter` | 精排重排序（本地 fallback 已移除，仅 API） | SiliconFlow API → 不排序 |
 | OCR | `services/ocr.py` | 图片文字识别 | SiliconFlow API → Tesseract(预留) |
 | WebScraper | `services/web_scraper.py` | Playwright 网页抓取 | Playwright → httpx 静态抓取 |
 | Cache | `services/cache.py` | Redis 缓存 + 滑动窗口限流(100次/时) | Redis 不可用→不限流 |
@@ -736,11 +735,13 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 `app/services/factory.py` 定义 7 个 `typing.Protocol` 接口 + 对应的 Adapter 类和工厂方法。
 
-**当前状态：Protocol 已定义但调用方未使用。** 所有业务代码（包括 Agent 工具层）直接 import 具体实现模块（如 `from app.services.vector_store import get_vector_store`），绕过了 Protocol 层。此外 `VectorStoreBase` 定义了 `upsert` 方法名，而实际实现用的是 `insert`，签名不一致。
+`VectorStoreBase` 的方法名已与实际实现对齐（`insert` / `search` / `delete_by_document`）。
+
+**当前状态：Protocol 方法名已对齐，但调用方仍直接 import 具体模块。** 所有业务代码（包括 Agent 工具层）直接 import `vector_store.get_vector_store()` 而非通过 `factory.get_vector_store()`。
 
 | Protocol | 定义方法 | 实际实现方法 | 调用方是否走 Protocol |
 |----------|---------|-------------|---------------------|
-| `VectorStoreBase` | upsert / search / delete_by_document | **insert** / search / delete_by_document | 否，4 处直接 import |
+| `VectorStoreBase` | insert / search / delete_by_document | insert / search / delete_by_document | 否，4 处直接 import |
 | `FullTextSearchBase` | search / index_chunk / delete_chunk | — | 否 |
 | `EmbeddingServiceBase` | encode / encode_query | encode / encode_query | 否 |
 | `RerankServiceBase` | rerank | rerank | 否 |
@@ -748,7 +749,7 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 | `LlmServiceBase` | stream_generate | stream_generate | 否 |
 | `ObjectStorageBase` | save / load / delete | — | 否 |
 
-**修复计划（详见 OPTIMIZATION-PLAN.md #7）**：对齐方法名 → 调用方改走工厂方法 → 编写 Protocol 参数化测试。
+**后续计划（详见 OPTIMIZATION-PLAN.md #7）**：调用方改走工厂方法 → 编写 Protocol 参数化测试。
 
 ---
 
@@ -758,27 +759,35 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 ```python
 # app/agent/state.py
+def _replace_list(old: list, new: list) -> list:
+    """Last-write-wins reducer: each node returns the complete list."""
+    if new is ... or new is None:
+        return old
+    return new
+
 class AgentState(TypedDict):
-    query: str                              # 用户查询（⚠ complex 路径未经指代消解）
+    query: str                              # 消解后的查询（用于检索）
+    original_query: str                     # 用户原始输入（用于回答生成和展示）
     user_id: str
     conversation_id: str
     collection_id: str | None
     intent: str                             # simple / complex
     plan: list[dict]                        # 直接覆盖（无 reducer）
-    tools_called: Annotated[list[dict], operator.add]   # 只追加，记录完整执行历史
-    chunks: Annotated[list[dict], operator.add]         # 只追加（⚠ 跨轮次可能重复）
+    tools_called: Annotated[list[dict], operator.add]   # 审计日志，只追加
+    chunks: Annotated[list[dict], _replace_list]        # 每轮替换，无跨轮次重复
     context: str
     answer: str
     reflection_result: str
+    reflection_scores: dict                 # {"relevance": N, "groundedness": N, "consistency": N}
     retry_count: int
     should_retry: bool
     error: str | None
 ```
 
-**已知问题：**
-- `chunks` 使用 `operator.add`，重试时旧轮次和新轮次结果直接拼接，跨轮次 chunk_id 重复（OPTIMIZATION-PLAN #6）
-- `plan` 直接覆盖，与 `chunks` 的追加语义不一致
-- 缺少 `original_query` 字段，无法同时保留原始输入和消解后的查询（OPTIMIZATION-PLAN #1）
+**已解决的问题：**
+- `chunks` 改用 `_replace_list` reducer（last-write-wins），每轮只保留最新检索结果
+- 新增 `original_query` 字段，保留用户原始输入用于展示
+- 新增 `reflection_scores` 字段，记录分维度评分
 
 ### 10.2 LangGraph 状态图
 
@@ -827,16 +836,12 @@ class AgentState(TypedDict):
 
 ### 10.3 工具层
 
-| 工具名 | 实际实现 | 功能 | 参数 |
-|--------|----------|------|------|
-| `hybrid_search` | 手动重写 RRF 逻辑（`tools.py:34-79`） | 向量+全文混合检索 + rerank | query, user_id, collection_id, top_k(40), vector_weight(0.7), bm25_weight(0.3) |
-| `fulltext_search` | `SearchService._bm25_search()` | BM25 全文检索 | query, user_id, top_k(20) |
+| 工具名 | 实现 | 功能 | 参数 |
+|--------|------|------|------|
+| `hybrid_search` | 调用 `SearchService.search_with_weights()` | 向量+全文混合检索（复用完整 v1.x 管线：查询改写→RRF→rerank） | query, user_id, collection_id, top_k(40), vector_weight(0.7), bm25_weight(0.3) |
+| `fulltext_search` | 调用 `SearchService._bm25_search()` | BM25 全文检索 | query, user_id, top_k(20) |
 
-**已知问题：**
-- `hybrid_search` 未复用 `SearchService.search()`，手动重写了 RRF 融合（约 45 行重复代码）
-- 跳过了 `QueryAnalyzer` 的查询改写步骤，检索质量可能低于 v1.x（OPTIMIZATION-PLAN #5）
-- 向量搜索和 BM25 串行执行，未并行化
-- 设计文档中列出的 `rerank`、`get_chunk_detail`、`get_document_info` 三个工具未实现
+`hybrid_search` 已改为复用 `SearchService.search_with_weights()`，零重复代码，查询改写步骤保留。
 
 ### 10.4 Checkpoint 状态持久化
 
@@ -852,7 +857,7 @@ class AgentState(TypedDict):
 ### 10.5 降级机制
 
 ```python
-# app/agent/degrade.py — 实际代码
+# app/agent/degrade.py — 系统水位检测
 def should_degrade() -> bool:
     cpu = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory().percent
@@ -863,33 +868,34 @@ def should_degrade() -> bool:
     return False
 ```
 
-**降级路径：**
+**降级路径（三层）：**
 
-| 触发点 | 代码位置 | 行为 | 覆盖范围 |
-|--------|---------|------|---------|
-| 系统过载 | `router.py:42-45` | SSE 构建前降级到 v1.x | ✓ 有效 |
-| Agent 构建异常 | `router.py:48-53` | `except Exception` 兜底 | ✓ 仅捕获 SSE 构建前异常 |
-| SSE 流内异常 | `router.py:332-334` | 发送 error 事件 | ⚠ **无法回退 v1.x**，直接暴露错误 |
+| 触发点 | 代码位置 | 行为 | 状态 |
+|--------|---------|------|------|
+| 系统过载 | `router.py:38-44` | SSE 构建前降级，发送 `agent_step` 降级通知 | ✅ 已实现 |
+| Agent 构建异常 | `router.py:46-54` | `except Exception` 兜底，发送降级通知 | ✅ 已实现 |
+| SSE 流内异常 | `router.py:364-390` | 流内降级：先发降级通知，再用 v1.x 逻辑检索生成 | ✅ 已实现 |
+| graph 超时(60s) | `router.py:276-308` | `asyncio.wait_for` 超时后流内降级到 v1.x | ✅ 已实现 |
+| 反思耗尽 | `router.py:342-344` | answer 末尾追加质量警告 `[注：此回答的质量校验未完成]` | ✅ 已实现 |
 
-**已知问题：**
-- `route_query` 的 try/except 只能捕获 `StreamingResponse` 构建前的异常，graph 执行在 `event_stream` 生成器内部（惰性求值），此时 HTTP 头已发出无法切换
-- 没有全局超时（`graph.ainvoke` 无 timeout），最坏情况一个请求可挂 3 分钟
-- 没有 Agent 并发控制，多个 Agent 请求并行可能打满 4 核
-- 降级时用户能看到行为差异（无 agent_step 事件），但无提示说明（OPTIMIZATION-PLAN #14）
+降级通知通过 SSE `agent_step` 事件发送（`tool: "system"`），前端可区分展示。
 
 ### 10.6 成本控制策略
 
-| 策略 | 设计文档声称 | 实际实现状态 |
-|------|------------|------------|
-| 轻量 LLM 中间步骤 | 意图分类 + 规划 + 反思用 glm-4-flash | ✅ 规划 + 反思用 glm-4.5-air；⚠ 意图分类未调用 LLM（纯规则） |
-| 规划缓存 | Redis TTL=1d，命中率 >50% | ❌ 未实现 |
-| 重试上限 | 最多 2 次反思重试 | ⚠ `agent_max_retries=2` 实际只允许 1 次重试（off-by-one） |
-| Embedding 缓存 | 复用 v1.x Redis 缓存 | ✅ 已实现，命中率约 80% |
-| 用户限流 | 复用 v1.x 100次/小时 | ✅ 已实现，但 v1.x 和 Agent 共享同一限流桶 |
-| 检索结果缓存 | — | ❌ 未实现（重试和重复查询无缓存） |
-| Agent 独立限流 | — | ❌ 未实现 |
+| 策略 | 状态 | 说明 |
+|------|------|------|
+| 轻量 LLM 中间步骤 | ✅ | 规划 + 反思用 glm-4.5-air；意图分类为纯规则零成本 |
+| Embedding 缓存 | ✅ | 复用 v1.x Redis 缓存层 |
+| 用户限流 | ✅ | v1.x 和 Agent 共享 100次/小时 |
+| 重试上限 | ✅ | `agent_max_retries=2`（总尝试 3 次） |
+| 本地 Reranker 禁用 | ✅ | 已移除本地 CrossEncoder fallback，防止 4G OOM |
+| httpx 连接池复用 | ✅ | `_get_http_client()` 单例复用 |
+| API 调用计数 | ✅ | `agent_api_calls_total` 在 `_call_lightweight_llm` 中 `.inc()` |
+| 规划缓存 | ❌ | 未实现 |
+| 检索结果缓存 | ❌ | 未实现 |
+| Agent 独立限流 | ❌ | 未实现 |
 
-成本增量预估尚无线上数据验证。"新增 ~3 次轻量 LLM"实际为 2 次（规划 + 反思），且重试场景的检索成本翻倍未计入（OPTIMIZATION-PLAN #9）。
+成本增量尚无线上数据验证。
 
 ---
 
@@ -915,8 +921,11 @@ def should_degrade() -> bool:
 |------|------|------|-----------|----------|
 | `agent_execution_duration_seconds` | Histogram | Agent 总执行时长 | ✅ | P95 > 2s |
 | `agent_tool_call_duration_seconds` | Histogram | 单次工具调用时长 | ❌ 已定义未使用 | P95 > 1s |
-| `agent_retry_total` | Counter | 反思重试次数 | ❌ 已定义未使用 | 1小时 > 100 |
+| `agent_retry_total` | Counter | 反思重试次数 | ✅ reflect 节点触发时 `.inc()` | 1小时 > 100 |
 | `agent_degrade_total` | Counter | 降级到 v1.x 次数 | ✅ | 1小时 > 50 |
+| `intent_classify_total` | Counter | 意图分类结果分布 | ✅ `intent_classify` 节点内 `.inc()` | — |
+| `intent_classify_duration_seconds` | Histogram | 意图分类耗时 | ✅ | — |
+| `agent_api_calls_total` | Counter | Agent API 调用次数 | ✅ `_call_lightweight_llm` 内 `.inc()` | — |
 
 ### 11.3 Agent Trace
 
@@ -1185,12 +1194,12 @@ D21 全量上线
 
 ### 待优化（详见 OPTIMIZATION-PLAN.md）
 
-6. **Protocol 接口层**：7 个 Protocol 已定义但未被调用方使用，方法名与实现不一致，替换底层组件时仍需改动调用方代码。
+6. **Protocol 接口层**：方法名已对齐，但调用方仍直接 import 具体模块，未通过工厂方法。需编写参数化测试后才能保证替换安全。
 
-7. **降级机制**：系统过载可在 SSE 构建前降级到 v1.x；但 SSE 流开始后的运行时故障无法回退，直接暴露 error 事件给用户。
+7. **成本可观测性**：`agent_api_calls_total` 已接入，但缺少 token 成本指标和按路径拆分的成本 dashboard。
 
-8. **Agent complex 路径无指代消解**：v1.x 和 Agent simple 路径有消解，complex 路径用原始 query 做检索。
+8. **规划缓存 / 检索结果缓存**：设计文档提到的规划缓存（Redis TTL=1d）和检索结果缓存均未实现。
 
-9. **反思节点**：未传入 chunk 原文，无法校验事实正确性；重试耗尽后跳过评估返回 "skip"，答案无质量保障。
+9. **Agent 独立限流**：v1.x 和 Agent 共享同一限流桶，缺少 Agent 路径的独立并发控制。
 
-10. **成本与性能可观测性**：部分 Prometheus 指标已定义但未使用（`agent_tool_call_duration`、`agent_retry_total`），无 token 成本指标，无按路径拆分的成本数据。
+10. **Checkpoint 状态持久化**：表结构已定义，`app/agent/checkpoint.py` 未实现。
