@@ -570,21 +570,25 @@ POST /api/v1/chat  { query, use_agent: true }
         ▼
  ┌─────────────────┐
  │ Query Router    │  router.py — 判断是否降级
- │ should_degrade? │  degrade.py: CPU>80% / MEM>85% → 降级到 v1.x
- │                 │  ⚠ 仅 SSE 构建前可降级；SSE 开始后的运行时故障无法回退
+ │ should_degrade? │  degrade.py: CPU>80% / MEM>85% → 降级到 v1.x（带用户通知）
  └────┬────────────┘
       │ 正常
       ▼
  ┌─────────────────────┐
- │ graph.ainvoke()     │  以下为 LangGraph 状态图内部流程
+ │ 指代消解             │  #1: resolve_query_with_history — 规则+LLM 两级消解
+ │ resolved_query      │  消解后的 query 传入 graph，原始 query 保留在 original_query
+ └────┬────────────────┘
+      │
+      ▼
+ ┌─────────────────────┐
+ │ graph.ainvoke()     │  asyncio.wait_for(timeout=60s)
+ │  超时 → 流内降级v1.x │
  │                     │
  │  ┌────────────────┐ │
- │  │intent_classify │ │  节点1: 纯规则(query_analyzer)
- │  │                │ │  ⚠ 未调用 LLM，与设计文档不一致
- │  │ keyword/simple │ │  keyword / 单轮 semantic → simple → 走 v1.x 检索
- │  │ → simple       │ │
- │  │ compare/multi  │ │  compare / multi_hop → complex
- │  │ → complex      │ │
+ │  │intent_classify │ │  节点1: 纯规则(query_analyzer) + Prometheus 指标
+ │  │                │ │
+ │  │ simple         │ │  keyword / 单轮 semantic → simple → 走 v1.x 检索
+ │  │ complex        │ │  compare / multi_hop → complex
  │  └───┬────────┬───┘ │
  │      │simple  │complex
  │      ▼        ▼     │
@@ -596,35 +600,34 @@ POST /api/v1/chat  { query, use_agent: true }
  │  └────────┘     │
  │            ┌────▼──────────┐
  │            │ execute_tools │  节点3: 执行计划中的工具
- │            │               │  ⚠ 工具内手动重写 RRF，未复用 v1.x SearchService
- │            │               │  ⚠ 未跳过查询改写步骤，检索质量可能低于 v1.x
+ │            │               │  hybrid_search 复用 SearchService.search_with_weights()
  │            └───┬───────────┘
  │                │
  │            ┌────▼──────────┐
- │            │generate_answer│  节点4: 复用 v1.x LLMService 流式生成
+ │            │generate_answer│  节点4: 复用 LLMService，用 original_query 生成
  │            └───┬───────────┘
  │                │
  │            ┌────▼──────────┐
  │            │   reflect     │  节点5: glm-4.5-air 校验答案
- │            │               │  ⚠ 未传入 chunk 原文，无法校验事实正确性
- │            │               │  ⚠ 重试耗尽时返回 "skip" 跳过评估
+ │            │               │  传入 top5 chunk 原文（各300字）做事实校验
+ │            │               │  分维度评分：relevance / groundedness / consistency
  │            └───┬───────────┘
  │                │
  │        ┌───────┼──────────┐
  │        │ pass  │ fail &   │
- │        │       │ retry<2  │
+ │        │       │ retry<N  │
  │        ▼       ▼          │
  │    ┌──────┐ ┌──────────┐  │
- │    │ END  │ │adjust_   │  │  节点6: 统一策略：扩大 top_k + 降低 vector_weight
- │    │      │ │  params  │──┘  ⚠ 不区分失败原因（回应不足/引用缺失/事实错误）
+ │    │ END  │ │adjust_   │  │  节点6: 根据最低分维度选择调整策略
+ │    │      │ │  params  │──┘  事实问题→降 vector_weight / 引用不足→扩 top_k
  │    └──────┘ └──────────┘
  └─────────────────────┘
 
- ⚠ 已知问题（详见 OPTIMIZATION-PLAN.md）:
- 1. Complex 路径无指代消解（state.query 始终为原始输入）
- 2. operator.add reducer 导致跨轮次 chunks 重复
- 3. agent_max_retries=2 实际只允许 1 次重试（off-by-one）
- 4. 反思重试耗尽后直接返回当前答案，无质量保障
+ 异常处理（三层降级）:
+ 1. SSE 构建前异常 → 返回降级 v1.x StreamingResponse（带通知）
+ 2. graph 超时 60s → 流内降级 v1.x（带通知）
+ 3. 流内其他异常 → 流内降级 v1.x（带通知）
+ 反思耗尽 → answer 末尾追加质量警告
 ```
 
 ### 6.3 SSE 事件格式
@@ -798,7 +801,7 @@ class AgentState(TypedDict):
                              │
                       ┌──────▼──────┐
                       │ intent_     │  纯规则（QueryAnalyzer）
-                      │ classify    │  ⚠ 未调用 LLM
+                      │ classify    │  + Prometheus 指标
                       └──────┬──────┘
                              │
                 ┌────────────┼────────────┐
@@ -812,25 +815,26 @@ class AgentState(TypedDict):
                            │              │
                     ┌──────▼──────┐        │
                     │  execute_   │        │
-                    │   tools     │ ← 手动重写 RRF（⚠ 未复用 v1.x）
+                    │   tools     │ ← 复用 SearchService.search_with_weights()
                     └──────┬──────┘        │
                            │              │
                     ┌──────▼──────┐        │
                     │  generate_  │        │
-                    │   answer    │ ← 复用 LLMService
+                    │   answer    │ ← 复用 LLMService（用 original_query）
                     └──────┬──────┘        │
                            │              │
                     ┌──────▼──────┐        │
-                    │   reflect   │ ← 轻量LLM（⚠ 未传 chunk 原文）
+                    │   reflect   │ ← 轻量LLM + top5 chunk 原文
+                    │             │   分维度评分: relevance/groundedness/consistency
                     └──────┬──────┘        │
                            │              │
                 ┌──────────┼──────────┐
                 │ pass     │ fail &   │
-                │          │ retry<2  │
+                │          │ retry<N  │
                 ▼          ▼          │
             ┌──────┐  ┌──────────┐    │
             │ END  │  │adjust_   │    │
-            │      │  │  params  │────┘  统一策略：扩大 top_k
+            │      │  │  params  │────┘  按最低分维度选择策略
             └──────┘  └──────────┘  (回到 execute_tools)
 ```
 
