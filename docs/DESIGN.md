@@ -146,9 +146,9 @@ app/
 │   ├── embedding.py            # Embedding 服务（Redis→API→Local→Dummy）
 │   ├── vector_store.py         # Milvus 向量存储
 │   ├── es.py                   # Elasticsearch 全文检索
-│   ├── rerank.py               # Rerank 服务
 │   ├── ocr.py                  # OCR 服务
 │   ├── web_scraper.py          # 网页抓取
+│   ├── tokenizer.py            # jieba 中文分词
 │   ├── cache.py                # Redis 缓存 + 限流
 │   ├── guard.py                # Prompt 注入检测
 │   ├── citation.py             # 引用校验
@@ -319,7 +319,7 @@ CREATE TABLE messages (
     model_name      VARCHAR(50),
     feedback        VARCHAR(20),
     token_usage     JSON,
-    agent_trace     JSONB,          -- v2.0 新增：Agent 执行追踪
+    agent_trace     JSONB,          -- v2.0 设计中新增，SQLAlchemy 模型中尚未添加
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -355,7 +355,7 @@ CREATE TABLE agent_checkpoints (
 - **JSON 元数据**：documents.metadata、chunks.metadata、users.settings 使用 JSON 字段，避免频繁加列
 - **软删除**：documents、collections、conversations 使用 `is_deleted` 而非物理删除
 - **所有查询强制带 user_id**：为未来 PostgreSQL RLS 做准备
-- **v2.0 零数据迁移**：只新增 `agent_checkpoints` 表和 `messages.agent_trace` 列，不修改任何 v1.x 表结构
+- **v2.0 零数据迁移**：设计上只新增 `agent_checkpoints` 表和 `messages.agent_trace` 列，不修改任何 v1.x 表结构。注意：`agent_trace` 列目前仅在设计文档 DDL 中定义，SQLAlchemy 模型中尚未添加
 
 ---
 
@@ -538,7 +538,7 @@ POST /api/v1/chat  { query, conversation_id?, collection_id?, use_agent: false }
       │
       ▼
  ┌─────────────────┐
- │ Rerank 精排     │  RerankAdapter — API / Local CrossEncoder → top10
+ │ Rerank 精排     │  RerankAdapter — API only → top10
  └────┬────────────┘
       │
       ▼
@@ -675,7 +675,7 @@ POST /api/v1/chat  { query, use_agent: true }
                    │
                    ▼
           ┌───────────────────┐
-          │    Rerank 精排     │  RerankAdapter: API → Local → 不排序
+          │    Rerank 精排     │  RerankAdapter: API only（本地 fallback 已移除）
           │    top 10 results │
           └───────────────────┘
 ```
@@ -721,7 +721,7 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 | ES | `services/es.py` | Elasticsearch 全文检索 + jieba 分词 + bulk 索引 | ES → PG FTS (to_tsvector) |
 | Search | `services/search.py` | 混合检索编排：查询分析→双通道→RRF融合→Rerank→fetch chunks。新增 `search_with_weights()` 供 Agent 工具层复用 | 向量/全文任一失败仍可用单通道 |
 | QueryAnalyzer | `services/query_analyzer.py` | 纯规则查询分类(keyword/semantic/compare/multi_hop) + 改写 + 子查询拆分 | — |
-| MultiTurn | `services/multi_turn.py` | 规则指代消解（"它/这个"→历史实体）+ LLM 上下文拼接 | 规则失败→原文透传 |
+| MultiTurn | `services/multi_turn.py` | 规则指代消解（"它/这个"→历史实体）+ LLM 上下文拼接（使用主模型 glm-5.1-openai，非轻量模型） | 规则失败→原文透传 |
 | LLM | `services/llm.py` | OpenAI 兼容 SSE 流式生成 | API → 本地模型(预留) |
 | Rerank | `factory.py:RerankAdapter` | 精排重排序（本地 fallback 已移除，仅 API） | SiliconFlow API → 不排序 |
 | OCR | `services/ocr.py` | 图片文字识别 | SiliconFlow API → Tesseract(预留) |
@@ -740,7 +740,7 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 `VectorStoreBase` 的方法名已与实际实现对齐（`insert` / `search` / `delete_by_document`）。
 
-**当前状态：Protocol 方法名已对齐，但调用方仍直接 import 具体模块。** 所有业务代码（包括 Agent 工具层）直接 import `vector_store.get_vector_store()` 而非通过 `factory.get_vector_store()`。
+**当前状态：Protocol 方法名已对齐，但存在两个问题：** (1) 调用方仍直接 import 具体模块（包括 Agent 工具层直接 import `vector_store.get_vector_store()` 而非通过 `factory.get_vector_store()`）。(2) `VectorStoreBase.search` 等方法在 Protocol 中声明为 `async def`，但实际实现（如 `MilvusStandaloneStore.search`）是同步方法。由于 Python Protocol 是 `runtime_checkable` 的鸭子类型检查，签名不完全匹配不会报错，但语义上不一致。
 
 | Protocol | 定义方法 | 实际实现方法 | 调用方是否走 Protocol |
 |----------|---------|-------------|---------------------|
@@ -847,6 +847,8 @@ class AgentState(TypedDict):
 
 `hybrid_search` 已改为复用 `SearchService.search_with_weights()`，零重复代码，查询改写步骤保留。
 
+> **已知限制：** `collection_id` 参数虽被 `search_with_weights()` 接收，但内部未转发到 `_single_search()` 和 `_fetch_chunks()`，当前被静默忽略。Agent 搜索路径无法按收藏夹过滤，需后续补全。
+
 ### 10.4 Checkpoint 状态持久化
 
 **当前状态：未实现。** `app/models/agent_checkpoint.py` 表结构已定义，但 `app/agent/` 目录下没有 `checkpoint.py` 文件。LangGraph graph 使用默认的内存状态管理，进程重启后状态丢失。
@@ -933,7 +935,7 @@ def should_degrade() -> bool:
 
 ### 11.3 Agent Trace
 
-**当前状态：部分实现。** `messages` 表有 `agent_trace` JSONB 字段（表结构已定义），但 `router.py` 和 `nodes.py` 中未写入 trace 数据。
+**当前状态：未实现。** `messages` 表的 `agent_trace` JSONB 字段仅在设计文档的 DDL 中定义，SQLAlchemy 模型（`app/models/message.py`）中尚未添加该列。需先完成数据库迁移（`alembic revision --autogenerate`）并添加模型字段后，才能在 `router.py` 中写入 trace 数据。
 
 设计目标（待实现）：每条 Agent 执行记录完整过程，存储到 `messages.agent_trace` JSONB 字段，供离线分析和问题排查。
 
@@ -990,7 +992,7 @@ def should_degrade() -> bool:
 | 规则引擎绕过 | 恶意 Prompt 可能逃逸规则 | LLM 辅助分类 + 人工审核日志 |
 | Checkpoint 竞态 | 并发写入同一 thread | Redis 原子操作 + PG 行锁 |
 | LLM API Key 泄露 | 云端 API 被盗用 | .env 不入库 + .gitignore + 最小权限 |
-| Agent 无限循环 | LLM 持续生成无效 Plan | 重试上限 2 次 + 全局超时 30s |
+| Agent 无限循环 | LLM 持续生成无效 Plan | 重试上限 2 次 + 全局超时 60s |
 
 ---
 
@@ -1044,7 +1046,7 @@ LLM_MODEL=glm-5.1-openai
 
 # ── Agent (v2.0) ──
 USE_AGENT=true
-AGENT_LIGHTWEIGHT_LLM=glm-4-flash
+AGENT_LIGHTWEIGHT_LLM=glm-4.5-air
 AGENT_MAX_RETRIES=2
 AGENT_DEGRADE_CPU_THRESHOLD=80.0
 AGENT_DEGRADE_MEM_THRESHOLD=85.0
@@ -1097,8 +1099,8 @@ docker run -d --name elasticsearch \
 # 1. 安装新依赖
 pip install langgraph langchain-core langchain psutil
 
-# 2. 数据库迁移（仅新增 1 张表 + 1 列）
-alembic revision --autogenerate -m "add_agent_checkpoints_and_trace"
+# 2. 数据库迁移（新增 agent_checkpoints 表；agent_trace 列待实现后迁移）
+alembic revision --autogenerate -m "add_agent_checkpoints"
 alembic upgrade head
 
 # 3. 配置 .env 新增 Agent 相关变量
@@ -1192,7 +1194,7 @@ D21 全量上线
 
 3. **RRF 混合检索 + 规则查询分析**：向量检索 + BM25 全文检索 → RRF 融合 → Rerank 精排。纯规则查询分类器支持 keyword/semantic/compare/multi_hop 四种模式，零 LLM 调用成本。
 
-4. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS）、Rerank（API→Local→不排序）、VectorStore（Milvus→Pickle）。任何单点故障不影响系统可用性。
+4. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS）、Rerank（仅 API，本地 fallback 已移除防止 OOM）、VectorStore（Milvus→Pickle）。任何单点故障不影响系统可用性。
 
 5. **结构化父子分块**：按标题层级分组，父 chunk 提供完整段落上下文，子 chunk 精确检索。检索结果自动附带 `parent_content`。
 

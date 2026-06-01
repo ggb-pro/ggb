@@ -186,7 +186,10 @@
 | LangGraph Checkpoint | ❌ 未实现 |
 | 检索结果缓存 | ❌ 未实现 |
 | 本地 Reranker fallback | ✅ 已移除 |
-| agent_trace JSONB | ❌ 未写入 |
+| agent_trace JSONB | ❌ SQLAlchemy 模型中未添加该列（仅设计文档 DDL 中有定义） |
+| collection_id 过滤 | ❌ `search_with_weights()` 接收但静默忽略，Agent 无法按收藏夹过滤 |
+| VectorStoreBase async/sync | ⚠️ Protocol 声明 `async def search` 但实现是同步方法 |
+| multi_turn LLM 模型 | ⚠️ `_llm_resolve` 使用主模型(glm-5.1-openai)，非轻量模型 |
 
 ---
 
