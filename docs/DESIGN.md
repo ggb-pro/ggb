@@ -22,8 +22,8 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 - 流式响应：SSE 实时推送 LLM token + 检索状态
 - 跨用户文档去重：相同文件只处理一次，其他用户克隆 chunk
 - **Agent 编排（v2.0）**：LangGraph 状态图驱动，意图分类→规划→工具执行→生成→反思闭环
-- **混合路由（v2.0）**：70% 简单查询走 v1.x 固定链路（<500ms），30% 复杂查询走 Agent 链路
-- **优雅降级（v2.0）**：Agent 故障自动回退 v1.x，用户无感知
+- **混合路由（v2.0）**：规则引擎分流，keyword/单轮 semantic → simple 走 v1.x，compare/multi_hop → complex 走 Agent
+- **降级机制（v2.0）**：系统过载时降级到 v1.x；SSE 流内运行时故障目前无法回退（待优化）
 
 ### 1.3 技术栈
 
@@ -43,7 +43,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 | Reranker | SiliconFlow API | BAAI/bge-reranker-v2-m3 | 精排（云端 API） |
 | OCR | SiliconFlow API | DeepSeek-OCR | 图片文字识别（云端 API） |
 | LLM（生成） | OpenAI 兼容 API | glm-5.1-openai | 流式生成（云端 API） |
-| LLM（规划/反思） | OpenAI 兼容 API | glm-4-flash | 轻量模型，意图分类 + 反思 |
+| LLM（规划/反思） | OpenAI 兼容 API | glm-4.5-air | 轻量模型，规划 + 反思（意图分类当前为纯规则，未调用 LLM） |
 | 中文分词 | jieba | 0.42.1 | 全文检索分词 |
 | 监控 | Prometheus + Grafana | - | 指标采集 + 可视化 |
 
@@ -51,7 +51,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 
 4 核 AMD EPYC 7K62 / 4 GB 内存 / 40 GB SSD / 腾讯云轻量 4Mbps
 
-全部 AI 模型走云端 API，服务器零模型内存占用。LangGraph Runtime <30MB（纯编排层，不加载模型）。月成本约 43 元（API）+ 100 元（服务器），Agent 路径成本增量 ≤15%。
+全部 AI 模型走云端 API（需配置 `rerank_allow_local=false` 禁止本地模型加载，否则 bge-reranker-v2-m3 会占 400-600MB）。LangGraph Runtime 为纯编排层 Python 对象，实际内存未做 profiling 验证。月成本约 43 元（API）+ 100 元（服务器），Agent 路径成本增量尚无线上数据验证。
 
 ---
 
@@ -97,8 +97,8 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
        │业务+状态 │  │Standalone│  │  8 jieba │  │缓存+状态│
        └─────────┘  └──────────┘  └──────────┘  └─────────┘
        ┌───────────────────────────────────────────────────┐
-       │                  云端 API（零本地内存）              │
-       │  轻量 LLM：glm-4-flash（意图分类 + 反思）          │
+       │                  云端 API（需禁用本地 fallback）     │
+       │  轻量 LLM：glm-4.5-air（规划 + 反思）              │
        │  大模型：glm-5.1-openai（最终生成）                 │
        │  原有 API：Embedding / Rerank / OCR                │
        └───────────────────────────────────────────────────┘
@@ -166,13 +166,12 @@ app/agent/                      ← 整个目录为 v2.0 新增
 ├── __init__.py
 ├── state.py                    # AgentState TypedDict 状态定义
 ├── graph.py                    # LangGraph 状态图构建
-├── nodes.py                    # 4 个节点（分类/规划/生成/反思）
+├── nodes.py                    # 6 个节点（分类/规划/执行/生成/反思/调参）
 ├── tools.py                    # 工具注册，包装 v1.x 服务
-├── checkpoint.py               # Redis+PG 双层 Checkpoint
 ├── router.py                   # 查询路由（简单→v1.x，复杂→Agent）
-└── degrade.py                  # 降级判断逻辑
+└── degrade.py                  # 降级判断逻辑（CPU/内存水位检测）
 
-app/models/agent_checkpoint.py  # 新增 1 张表
+app/models/agent_checkpoint.py  # 表结构已定义，Checkpoint 功能待实现
 app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
 ```
 
@@ -195,8 +194,9 @@ app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
 | FastAPI + 业务代码 | 200 MB | 含所有业务代码 |
 | Redis | 60 MB | 缓存 + 限流 + Agent 热状态 |
 | Nginx | 20 MB | 反向代理 |
-| **LangGraph Runtime** | **<30 MB** | 纯编排层，不加载模型 |
-| **常驻合计** | **~2.2 GB** | |
+| **LangGraph Runtime** | **<30 MB** | 纯编排层（理论值，未做 profiling 验证） |
+| **本地 Reranker fallback** | **400-600 MB** | bge-reranker-v2-m3，需配置禁用 |
+| **常驻合计** | **~2.2 GB**（不含本地 Reranker） | |
 | **剩余可用** | **~1.8 GB** | 连接池 + 请求缓冲 |
 
 ---
@@ -571,40 +571,61 @@ POST /api/v1/chat  { query, use_agent: true }
         ▼
  ┌─────────────────┐
  │ Query Router    │  router.py — 判断是否降级
- │ should_degrade? │  degrade.py: CPU>80% / MEM>85% / LLM不可用 → 降级到 v1.x
+ │ should_degrade? │  degrade.py: CPU>80% / MEM>85% → 降级到 v1.x
+ │                 │  ⚠ 仅 SSE 构建前可降级；SSE 开始后的运行时故障无法回退
  └────┬────────────┘
       │ 正常
       ▼
- ┌─────────────────┐
- │ intent_classify │  节点1: 规则预筛(query_analyzer) + 轻量LLM(glm-4-flash)
- │ ~70% simple     │  keyword/单轮semantic → simple → 直接走 v1.x
- │ ~30% complex    │  compare/multi_hop/未知 → complex → 进入 Agent 流程
- └────┬────────────┘
-      │ complex
-      ▼
- ┌─────────────────┐
- │ generate_plan   │  节点2: 轻量LLM 生成工具调用计划
- │                 │  简单→1步 hybrid_search, 对比→2步搜索+rerank, 多跳→链式检索
- └────┬────────────┘
-      │
-      ▼
- ┌─────────────────┐
- │ execute_tools   │  节点3: LangGraph ToolNode 执行计划中的工具
- │                 │  工具层包装 v1.x 服务（hybrid_search, fulltext_search, rerank 等）
- └────┬────────────┘
-      │
-      ▼
- ┌─────────────────┐
- │ generate_answer │  节点4: 复用 v1.x LLMService，基于工具结果生成最终回答
- └────┬────────────┘
-      │
-      ▼
- ┌─────────────────┐
- │ reflect         │  节点5: 轻量LLM 校验答案质量（回应性/引用支撑/事实正确）
- │ pass → END      │
- │ fail & retry<2  │  → adjust_params → 回到 execute_tools
- │ fail & retry>=2 │  → END（返回当前答案）或 degrade to v1.x
- └─────────────────┘
+ ┌─────────────────────┐
+ │ graph.ainvoke()     │  以下为 LangGraph 状态图内部流程
+ │                     │
+ │  ┌────────────────┐ │
+ │  │intent_classify │ │  节点1: 纯规则(query_analyzer)
+ │  │                │ │  ⚠ 未调用 LLM，与设计文档不一致
+ │  │ keyword/simple │ │  keyword / 单轮 semantic → simple → 走 v1.x 检索
+ │  │ → simple       │ │
+ │  │ compare/multi  │ │  compare / multi_hop → complex
+ │  │ → complex      │ │
+ │  └───┬────────┬───┘ │
+ │      │simple  │complex
+ │      ▼        ▼     │
+ │  ┌────────┐ ┌─────────────┐
+ │  │ v1.x   │ │generate_plan│  节点2: glm-4.5-air 生成工具调用计划
+ │  │ 检索   │ │             │  JSON 解析 + 工具名白名单校验
+ │  │+生成   │ │             │  fallback: 单步 hybrid_search
+ │  │(END)   │ └───┬─────────┘
+ │  └────────┘     │
+ │            ┌────▼──────────┐
+ │            │ execute_tools │  节点3: 执行计划中的工具
+ │            │               │  ⚠ 工具内手动重写 RRF，未复用 v1.x SearchService
+ │            │               │  ⚠ 未跳过查询改写步骤，检索质量可能低于 v1.x
+ │            └───┬───────────┘
+ │                │
+ │            ┌────▼──────────┐
+ │            │generate_answer│  节点4: 复用 v1.x LLMService 流式生成
+ │            └───┬───────────┘
+ │                │
+ │            ┌────▼──────────┐
+ │            │   reflect     │  节点5: glm-4.5-air 校验答案
+ │            │               │  ⚠ 未传入 chunk 原文，无法校验事实正确性
+ │            │               │  ⚠ 重试耗尽时返回 "skip" 跳过评估
+ │            └───┬───────────┘
+ │                │
+ │        ┌───────┼──────────┐
+ │        │ pass  │ fail &   │
+ │        │       │ retry<2  │
+ │        ▼       ▼          │
+ │    ┌──────┐ ┌──────────┐  │
+ │    │ END  │ │adjust_   │  │  节点6: 统一策略：扩大 top_k + 降低 vector_weight
+ │    │      │ │  params  │──┘  ⚠ 不区分失败原因（回应不足/引用缺失/事实错误）
+ │    └──────┘ └──────────┘
+ └─────────────────────┘
+
+ ⚠ 已知问题（详见 OPTIMIZATION-PLAN.md）:
+ 1. Complex 路径无指代消解（state.query 始终为原始输入）
+ 2. operator.add reducer 导致跨轮次 chunks 重复
+ 3. agent_max_retries=2 实际只允许 1 次重试（off-by-one）
+ 4. 反思重试耗尽后直接返回当前答案，无质量保障
 ```
 
 ### 6.3 SSE 事件格式
@@ -614,6 +635,7 @@ POST /api/v1/chat  { query, use_agent: true }
 ```json
 {"type": "conversation", "conversation_id": "uuid"}
 {"type": "status", "message": "Searching..."}
+{"type": "agent_step", "tool": "agent|hybrid_search|...", "thought": "意图分析中...|检索到 N 个结果"}  // v2.0 Agent 专用
 {"type": "citations", "data": [{"chunk_id": "...", "score": 0.95, "snippet": "..."}]}
 {"type": "token", "content": "部分回答文本"}
 {"type": "done", "conversation_id": "uuid"}
@@ -712,19 +734,21 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 ## 9. 接口抽象层
 
-`app/services/factory.py` 定义 7 个 `typing.Protocol` 接口，所有业务代码通过接口调用，不绑定具体实现。Agent 工具层同样通过 Protocol 抽象调用底层服务。
+`app/services/factory.py` 定义 7 个 `typing.Protocol` 接口 + 对应的 Adapter 类和工厂方法。
 
-| Protocol | 方法 | 当前实现 | 未来实现 |
-|----------|------|----------|----------|
-| `VectorStoreBase` | upsert / search / delete_by_document | Milvus Standalone | Qdrant, Milvus Cluster |
-| `FullTextSearchBase` | search / index_chunk / delete_chunk | Elasticsearch 8.x (jieba) | Meilisearch, PG FTS only |
-| `EmbeddingServiceBase` | encode / encode_query | SiliconFlow API (bge-m3) | Local model, OpenAI |
-| `RerankServiceBase` | rerank | SiliconFlow API (bge-reranker-v2-m3) | Local CrossEncoder, Cohere |
-| `OcrServiceBase` | recognize | SiliconFlow API (DeepSeek-OCR) | PaddleOCR, Tesseract |
-| `LlmServiceBase` | stream_generate | OpenAI 兼容 API (glm-5.1-openai) | 任意 OpenAI 兼容端点 |
-| `ObjectStorageBase` | save / load / delete | 本地文件系统 | S3, MinIO |
+**当前状态：Protocol 已定义但调用方未使用。** 所有业务代码（包括 Agent 工具层）直接 import 具体实现模块（如 `from app.services.vector_store import get_vector_store`），绕过了 Protocol 层。此外 `VectorStoreBase` 定义了 `upsert` 方法名，而实际实现用的是 `insert`，签名不一致。
 
-**设计优势**：替换底层组件只需新增一个 Adapter 类 + 修改工厂方法，业务代码和 Agent 层零改动。
+| Protocol | 定义方法 | 实际实现方法 | 调用方是否走 Protocol |
+|----------|---------|-------------|---------------------|
+| `VectorStoreBase` | upsert / search / delete_by_document | **insert** / search / delete_by_document | 否，4 处直接 import |
+| `FullTextSearchBase` | search / index_chunk / delete_chunk | — | 否 |
+| `EmbeddingServiceBase` | encode / encode_query | encode / encode_query | 否 |
+| `RerankServiceBase` | rerank | rerank | 否 |
+| `OcrServiceBase` | recognize | recognize | 否 |
+| `LlmServiceBase` | stream_generate | stream_generate | 否 |
+| `ObjectStorageBase` | save / load / delete | — | 否 |
+
+**修复计划（详见 OPTIMIZATION-PLAN.md #7）**：对齐方法名 → 调用方改走工厂方法 → 编写 Protocol 参数化测试。
 
 ---
 
@@ -735,24 +759,26 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 ```python
 # app/agent/state.py
 class AgentState(TypedDict):
-    # 不可变：请求级上下文
-    query: str                              # 原始用户查询
-    user_id: str                            # 用户 ID
-    conversation_id: str                    # 会话 ID
-    collection_id: str | None               # 文档集合过滤
-
-    # 可变：执行状态
-    intent: str                             # simple / complex / compare / multi_hop
-    plan: list[dict]                        # LLM 生成的执行计划
-    tools_called: Annotated[list[dict], operator.add]   # 已调用工具记录（只追加）
-    chunks: Annotated[list[dict], operator.add]         # 检索到的 chunk（只追加）
-    context: str                            # 拼接后的上下文
-    answer: str                             # 生成的回答
-    reflection_result: str                  # 反思结论
-    retry_count: int                        # 当前重试次数
-    should_retry: bool                      # 是否需要重试
-    error: str | None                       # 错误信息
+    query: str                              # 用户查询（⚠ complex 路径未经指代消解）
+    user_id: str
+    conversation_id: str
+    collection_id: str | None
+    intent: str                             # simple / complex
+    plan: list[dict]                        # 直接覆盖（无 reducer）
+    tools_called: Annotated[list[dict], operator.add]   # 只追加，记录完整执行历史
+    chunks: Annotated[list[dict], operator.add]         # 只追加（⚠ 跨轮次可能重复）
+    context: str
+    answer: str
+    reflection_result: str
+    retry_count: int
+    should_retry: bool
+    error: str | None
 ```
+
+**已知问题：**
+- `chunks` 使用 `operator.add`，重试时旧轮次和新轮次结果直接拼接，跨轮次 chunk_id 重复（OPTIMIZATION-PLAN #6）
+- `plan` 直接覆盖，与 `chunks` 的追加语义不一致
+- 缺少 `original_query` 字段，无法同时保留原始输入和消解后的查询（OPTIMIZATION-PLAN #1）
 
 ### 10.2 LangGraph 状态图
 
@@ -762,8 +788,8 @@ class AgentState(TypedDict):
                       └──────┬──────┘
                              │
                       ┌──────▼──────┐
-                      │ intent_     │  规则预筛 + 轻量LLM
-                      │ classify    │  (<100ms)
+                      │ intent_     │  纯规则（QueryAnalyzer）
+                      │ classify    │  ⚠ 未调用 LLM
                       └──────┬──────┘
                              │
                 ┌────────────┼────────────┐
@@ -771,13 +797,13 @@ class AgentState(TypedDict):
                 ▼            ▼             │
         ┌──────────┐  ┌──────────┐        │
         │ 走 v1.x  │  │generate_ │        │
-        │ 固定管线  │  │  plan    │        │
+        │ 检索+生成│  │  plan    │        │
         │ (END)    │  │(轻量LLM) │        │
         └──────────┘  └────┬─────┘        │
                            │              │
                     ┌──────▼──────┐        │
                     │  execute_   │        │
-                    │   tools     │ ← ToolNode(包装v1.x服务)
+                    │   tools     │ ← 手动重写 RRF（⚠ 未复用 v1.x）
                     └──────┬──────┘        │
                            │              │
                     ┌──────▼──────┐        │
@@ -786,7 +812,7 @@ class AgentState(TypedDict):
                     └──────┬──────┘        │
                            │              │
                     ┌──────▼──────┐        │
-                    │   reflect   │ ← 轻量LLM校验
+                    │   reflect   │ ← 轻量LLM（⚠ 未传 chunk 原文）
                     └──────┬──────┘        │
                            │              │
                 ┌──────────┼──────────┐
@@ -795,111 +821,108 @@ class AgentState(TypedDict):
                 ▼          ▼          │
             ┌──────┐  ┌──────────┐    │
             │ END  │  │adjust_   │    │
-            │      │  │  params  │────┘
+            │      │  │  params  │────┘  统一策略：扩大 top_k
             └──────┘  └──────────┘  (回到 execute_tools)
 ```
 
 ### 10.3 工具层
 
-| 工具名 | 包装的 v1.x 服务 | 功能 | 参数 |
-|--------|------------------|------|------|
-| `hybrid_search` | `SearchService._single_search()` | 向量+全文混合检索 | query, top_k(40), vector_weight(0.7) |
-| `fulltext_search` | `es.search()` / PG FTS | BM25 全文检索 | query, top_k(20) |
-| `rerank` | `RerankAdapter.rerank()` | 精排重排序 | query, documents, top_n |
-| `get_chunk_detail` | `Chunk` 模型查询 | 获取完整 chunk 内容及文档信息 | chunk_id |
-| `get_document_info` | `Document` 模型查询 | 获取文档元数据 | document_id |
+| 工具名 | 实际实现 | 功能 | 参数 |
+|--------|----------|------|------|
+| `hybrid_search` | 手动重写 RRF 逻辑（`tools.py:34-79`） | 向量+全文混合检索 + rerank | query, user_id, collection_id, top_k(40), vector_weight(0.7), bm25_weight(0.3) |
+| `fulltext_search` | `SearchService._bm25_search()` | BM25 全文检索 | query, user_id, top_k(20) |
 
-所有工具继承 `langchain.tools.BaseTool`，内部通过 Protocol 接口调用 v1.x 服务，零重复代码。
+**已知问题：**
+- `hybrid_search` 未复用 `SearchService.search()`，手动重写了 RRF 融合（约 45 行重复代码）
+- 跳过了 `QueryAnalyzer` 的查询改写步骤，检索质量可能低于 v1.x（OPTIMIZATION-PLAN #5）
+- 向量搜索和 BM25 串行执行，未并行化
+- 设计文档中列出的 `rerank`、`get_chunk_detail`、`get_document_info` 三个工具未实现
 
-### 10.4 双层 Checkpoint
+### 10.4 Checkpoint 状态持久化
+
+**当前状态：未实现。** `app/models/agent_checkpoint.py` 表结构已定义，但 `app/agent/` 目录下没有 `checkpoint.py` 文件。LangGraph graph 使用默认的内存状态管理，进程重启后状态丢失。
+
+设计目标（待实现）：
 
 | 层级 | 存储 | Key | TTL | 用途 |
 |------|------|-----|-----|------|
-| 热层 | Redis | `agent:ckpt:{thread_id}` | 1 小时 | 正在执行的任务状态，读写快 |
+| 热层 | Redis | `agent:ckpt:{thread_id}` | 1 小时 | 正在执行的任务状态 |
 | 冷层 | PostgreSQL `agent_checkpoints` | `thread_id` (PK) | 30 天 | 历史回溯、进程重启恢复 |
-
-写入策略：每次状态变更同时写 Redis（`SETEX`）和 PG（`merge`）。
-读取策略：先查 Redis，命中直接返回；未命中查 PG，并回填 Redis。
 
 ### 10.5 降级机制
 
 ```python
-# app/agent/degrade.py
+# app/agent/degrade.py — 实际代码
 def should_degrade() -> bool:
-    # 条件1: CPU > 80%
-    if psutil.cpu_percent(interval=0.1) > 80:
+    cpu = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory().percent
+    if cpu > settings.agent_degrade_cpu_threshold:   # 默认 80%
         return True
-    # 条件2: 内存 > 85% (4G 下约 3.4G)
-    if psutil.virtual_memory().percent > 85:
-        return True
-    # 条件3: 轻量 LLM 不可用
-    if not check_llm_health(model="glm-4-flash"):
+    if mem > settings.agent_degrade_mem_threshold:   # 默认 85%
         return True
     return False
 ```
 
-降级路径：`route_query()` → `should_degrade()` 为 True → 静默走 v1.x 固定管线，用户无感知。
+**降级路径：**
+
+| 触发点 | 代码位置 | 行为 | 覆盖范围 |
+|--------|---------|------|---------|
+| 系统过载 | `router.py:42-45` | SSE 构建前降级到 v1.x | ✓ 有效 |
+| Agent 构建异常 | `router.py:48-53` | `except Exception` 兜底 | ✓ 仅捕获 SSE 构建前异常 |
+| SSE 流内异常 | `router.py:332-334` | 发送 error 事件 | ⚠ **无法回退 v1.x**，直接暴露错误 |
+
+**已知问题：**
+- `route_query` 的 try/except 只能捕获 `StreamingResponse` 构建前的异常，graph 执行在 `event_stream` 生成器内部（惰性求值），此时 HTTP 头已发出无法切换
+- 没有全局超时（`graph.ainvoke` 无 timeout），最坏情况一个请求可挂 3 分钟
+- 没有 Agent 并发控制，多个 Agent 请求并行可能打满 4 核
+- 降级时用户能看到行为差异（无 agent_step 事件），但无提示说明（OPTIMIZATION-PLAN #14）
 
 ### 10.6 成本控制策略
 
-| 策略 | 实现 |
-|------|------|
-| 轻量 LLM 中间步骤 | 意图分类 + 规划 + 反思用 glm-4-flash（成本为 glm-5.1 的 ~1/10） |
-| 规划缓存 | 相似查询复用 Redis 缓存的 Plan（TTL=1天，命中率目标 >50%） |
-| 重试上限 | 最多 2 次反思重试，硬性限制 |
-| Embedding 缓存 | 复用 v1.x Redis 缓存层（命中率 ~80%） |
-| 用户限流 | 复用 v1.x 100次/小时 Redis 限流 |
+| 策略 | 设计文档声称 | 实际实现状态 |
+|------|------------|------------|
+| 轻量 LLM 中间步骤 | 意图分类 + 规划 + 反思用 glm-4-flash | ✅ 规划 + 反思用 glm-4.5-air；⚠ 意图分类未调用 LLM（纯规则） |
+| 规划缓存 | Redis TTL=1d，命中率 >50% | ❌ 未实现 |
+| 重试上限 | 最多 2 次反思重试 | ⚠ `agent_max_retries=2` 实际只允许 1 次重试（off-by-one） |
+| Embedding 缓存 | 复用 v1.x Redis 缓存 | ✅ 已实现，命中率约 80% |
+| 用户限流 | 复用 v1.x 100次/小时 | ✅ 已实现，但 v1.x 和 Agent 共享同一限流桶 |
+| 检索结果缓存 | — | ❌ 未实现（重试和重复查询无缓存） |
+| Agent 独立限流 | — | ❌ 未实现 |
 
-成本增量预估：70% 简单查询走 v1.x 零增量；30% 复杂查询 Agent 路径新增 ~3 次轻量 LLM 调用，总增量约原成本 12-15%。
+成本增量预估尚无线上数据验证。"新增 ~3 次轻量 LLM"实际为 2 次（规划 + 反思），且重试场景的检索成本翻倍未计入（OPTIMIZATION-PLAN #9）。
 
 ---
 
 ## 11. 可观测性
 
-### 11.1 v1.x Prometheus 指标（6 个）
+### 11.1 v1.x Prometheus 指标
 
-| 指标 | 类型 | 含义 |
-|------|------|------|
-| `rag_retrieval_duration_seconds` | Histogram | 混合检索总耗时 |
-| `rag_results_count` | Histogram | Rerank 后结果数量 |
-| `rag_rerank_duration_seconds` | Histogram | Rerank 耗时 |
-| `rag_llm_duration_seconds` | Histogram | LLM 生成耗时 |
-| `embedding_api_duration_seconds` | Histogram | Embedding API 调用耗时 |
-| `rerank_api_duration_seconds` | Histogram | Rerank API 调用耗时 |
-| `ocr_api_duration_seconds` | Histogram | OCR API 调用耗时 |
-| `api_error_total` | Counter | API 调用失败次数（按 service 标签） |
-| `model_memory_bytes` | Gauge | 本地模型内存占用 |
+| 指标 | 类型 | 含义 | 是否已接入 |
+|------|------|------|-----------|
+| `rag_retrieval_duration_seconds` | Histogram | 混合检索总耗时 | ✅ |
+| `rag_results_count` | Histogram | Rerank 后结果数量 | ✅ |
+| `rag_rerank_duration_seconds` | Histogram | Rerank 耗时 | ✅ |
+| `rag_llm_duration_seconds` | Histogram | LLM 生成耗时 | ✅ |
+| `embedding_api_duration_seconds` | Histogram | Embedding API 调用耗时 | ✅ |
+| `rerank_api_duration_seconds` | Histogram | Rerank API 调用耗时 | ✅ |
+| `ocr_api_duration_seconds` | Histogram | OCR API 调用耗时 | ✅ |
+| `api_error_total` | Counter | API 调用失败次数（按 service 标签） | ✅ |
+| `model_memory_bytes` | Gauge | 本地模型内存占用 | ❌ 已定义但未调用 `.set()` |
 
-### 11.2 v2.0 新增 Prometheus 指标（4 个）
+### 11.2 v2.0 新增 Prometheus 指标
 
-| 指标 | 类型 | 含义 | 告警阈值 |
-|------|------|------|----------|
-| `agent_execution_duration_seconds` | Histogram | Agent 总执行时长 | P95 > 2s |
-| `agent_tool_call_duration_seconds` | Histogram | 单次工具调用时长 | P95 > 1s |
-| `agent_retry_total` | Counter | 反思重试次数 | 1小时 > 100 |
-| `agent_degrade_total` | Counter | 降级到 v1.x 次数 | 1小时 > 50 |
+| 指标 | 类型 | 含义 | 是否已接入 | 告警阈值 |
+|------|------|------|-----------|----------|
+| `agent_execution_duration_seconds` | Histogram | Agent 总执行时长 | ✅ | P95 > 2s |
+| `agent_tool_call_duration_seconds` | Histogram | 单次工具调用时长 | ❌ 已定义未使用 | P95 > 1s |
+| `agent_retry_total` | Counter | 反思重试次数 | ❌ 已定义未使用 | 1小时 > 100 |
+| `agent_degrade_total` | Counter | 降级到 v1.x 次数 | ✅ | 1小时 > 50 |
 
 ### 11.3 Agent Trace
 
-每条 Agent 执行生成唯一 `trace_id`，记录完整执行过程：
+**当前状态：部分实现。** `messages` 表有 `agent_trace` JSONB 字段（表结构已定义），但 `router.py` 和 `nodes.py` 中未写入 trace 数据。
 
-```json
-{
-  "trace_id": "uuid",
-  "user_id": "...",
-  "query": "...",
-  "intent": "complex",
-  "plan": [{"tool": "hybrid_search", "args": {...}}],
-  "tools_called": [{"tool": "hybrid_search", "duration_ms": 320, "result_count": 10}],
-  "answer_length": 1234,
-  "reflection": "pass",
-  "retry_count": 0,
-  "total_ms": 1200,
-  "degraded": false
-}
-```
-
-存储到 `messages.agent_trace` JSONB 字段（v2.0 新增列），供离线分析和问题排查。
+设计目标（待实现）：每条 Agent 执行记录完整过程，存储到 `messages.agent_trace` JSONB 字段，供离线分析和问题排查。
 
 ### 11.4 告警规则
 
@@ -1146,24 +1169,28 @@ D21 全量上线
 
 ---
 
-## 17. 亮点设计总结
+## 17. 设计现状总结
 
-1. **渐进式架构演进**：v2.0 = v1.x + Agent 层。16 个 service 模块、7 个 Protocol 接口全部原封不动复用。改动量仅 3 个文件约 20 行代码，一周完成 MVP，灰度上线零停机。
+### 已落地
 
-2. **工业级 LangGraph 落地**：解决了 4 个生产级问题——状态持久化（Redis 热 + PG 冷双层 Checkpoint）、降级机制（Agent 异常静默降级到 v1.x）、成本控制（70% 简单查询零增量）、全链路可观测性（Prometheus + agent_trace）。
+1. **渐进式架构演进**：v2.0 = v1.x + Agent 层。v1.x 的 16 个 service 模块原封不动复用，v2.0 新增 `app/agent/` 目录（6 个文件），改动量仅 3 个文件约 20 行代码。
 
-3. **混合驱动的成本-性能平衡**：70% 简单查询走 v1.x 固定链路（<500ms），30% 复杂查询走 Agent 路径（<1.5s）。比全量 Agent 方案节省 85% 额外 API 成本。
+2. **LangGraph 状态图编排**：6 节点状态图（intent_classify → generate_plan → execute_tools → generate_answer → reflect → adjust_params），条件路由 + 重试循环，进程内执行零额外服务依赖。
 
-4. **基于 Protocol 抽象的无侵入设计**：7 个 Protocol 接口（VectorStore、FTS、Embedding、Rerank、OCR、LLM、ObjectStorage）保证 Agent 工具层与底层实现解耦。替换 Milvus/ES/LLM 时 Agent 层代码零改动。
+3. **RRF 混合检索 + 规则查询分析**：向量检索 + BM25 全文检索 → RRF 融合 → Rerank 精排。纯规则查询分类器支持 keyword/semantic/compare/multi_hop 四种模式，零 LLM 调用成本。
 
-5. **RRF 混合检索 + 规则查询分析**：向量检索 + BM25 全文检索 → 加权倒数排名融合 → Rerank 精排。纯规则查询分类器零 LLM 调用成本，支持 keyword/semantic/compare/multi_hop 四种模式。
+4. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS）、Rerank（API→Local→不排序）、VectorStore（Milvus→Pickle）。任何单点故障不影响系统可用性。
 
-6. **结构化父子分块**：按标题层级分组，父 chunk 提供完整段落上下文，子 chunk 精确检索。检索结果自动附带 `parent_content`，解决上下文截断问题。
+5. **结构化父子分块**：按标题层级分组，父 chunk 提供完整段落上下文，子 chunk 精确检索。检索结果自动附带 `parent_content`。
 
-7. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS）、Rerank（API→Local→不排序）、Agent（故障→v1.x）。任何单点故障不影响系统可用性。
+### 待优化（详见 OPTIMIZATION-PLAN.md）
 
-8. **双层 Checkpoint 状态持久化**：Redis 热层（1h TTL）保证执行中状态快速读写，PG 冷层（30d）保证进程重启恢复和审计追溯。
+6. **Protocol 接口层**：7 个 Protocol 已定义但未被调用方使用，方法名与实现不一致，替换底层组件时仍需改动调用方代码。
 
-9. **4C4G 硬件约束下的精准资源预算**：LangGraph Runtime <30MB（纯编排层，不加载模型），全部 AI 模型走云端 API。总常驻 ~2.2GB，剩余 ~1.8GB 给连接池和请求缓冲。月成本 ~143 元。
+7. **降级机制**：系统过载可在 SSE 构建前降级到 v1.x；但 SSE 流开始后的运行时故障无法回退，直接暴露 error 事件给用户。
 
-10. **前瞻性扩展路径**：从 v2.0 到百万用户 v3.0 的路径完全预设——Agent 无状态化可直接水平扩展、多 Agent 协作拆分角色、底层组件按 Protocol 独立替换。每一步都是增量演进，不需要推翻上一步架构。
+8. **Agent complex 路径无指代消解**：v1.x 和 Agent simple 路径有消解，complex 路径用原始 query 做检索。
+
+9. **反思节点**：未传入 chunk 原文，无法校验事实正确性；重试耗尽后跳过评估返回 "skip"，答案无质量保障。
+
+10. **成本与性能可观测性**：部分 Prometheus 指标已定义但未使用（`agent_tool_call_duration`、`agent_retry_total`），无 token 成本指标，无按路径拆分的成本数据。
