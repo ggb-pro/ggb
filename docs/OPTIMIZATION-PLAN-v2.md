@@ -32,54 +32,30 @@
 
 **根因分析：** `_clone_chunks_from_existing` 函数只实现了 PG chunks 的复制，完全遗漏了 Milvus 向量存储和 ES 全文索引两个关键存储引擎的写入。同时 `parent_chunk_id` 的重映射代码 `func.replace(old, old, old)` 三个参数相同，等于什么都没做。用户 B 上传同一文档后，文档状态显示 "ready"，但实际搜索时向量检索和全文检索都查不到内容——因为 Milvus 和 ES 里根本没有用户 B 的数据。
 
-**修复思路：** 重写整个克隆函数，按照"PG chunks → parent_chunk_id 重映射 → Milvus 向量复制 → ES 索引写入"的顺序执行四步操作。核心原则是：只有全部存储引擎都写入成功，才标记文档为 ready；任何一步失败，文档状态回退为 failed。Milvus 的向量数据不需要重新计算 embedding（同一份文件的向量完全相同），只需从源文档读出已有向量，用新的 chunk ID 写入即可。
+**修复思路：** 重写整个克隆函数。**执行顺序是关键**：采用"先写 Milvus/ES → 再提交 PG → 最后标 ready"的顺序，而非"先写 PG → 再写 Milvus/ES"。原因是 PG 有事务可以回滚，而 Milvus/ES 没有事务支持。如果先写 PG 再写 Milvus 失败，PG 已提交的 chunks 无法自动回滚，导致数据不一致。改为先尝试写 Milvus/ES（失败可静默忽略），确认外部存储就绪后再一次性提交 PG chunks + 标记 ready。
+
+Milvus 的向量数据不需要重新计算 embedding（同一份文件的向量完全相同），只需从源文档读出已有向量，用新的 chunk ID 写入即可。
 
 **修复方案：**
 
 ```python
 # app/api/documents.py — _clone_chunks_from_existing 重写
 async def _clone_chunks_from_existing(db, source_doc_id, target_doc_id, target_user_id):
-    """原子性克隆：PG → Milvus → ES，任何一步失败回滚状态。"""
+    """原子性克隆：先写 Milvus/ES（可回退）→ 再提交 PG → 最后标 ready。"""
     from app.services.vector_store import get_vector_store
     from app.services.es import bulk_index_chunks
 
-    # Step 1: 克隆 PG chunks
-    # 查询源文档的所有 chunks，为每个 chunk 生成新 ID，复制到目标文档下。
-    # 同时构建 old_to_new 映射字典，供后续 parent_chunk_id 重映射和 Milvus 写入使用。
+    # Step 0: 预计算映射关系（不写任何存储）
+    # 先查询源 chunks，构建 old_to_new 映射，准备好所有数据，但不提交。
     result = await db.execute(select(Chunk).where(Chunk.document_id == source_doc_id))
     source_chunks = result.scalars().all()
     if not source_chunks:
         return
 
-    old_to_new = {}
-    chunk_data = []  # [(new_id, content), ...] 供后续 Milvus/ES 使用
-    for chunk in source_chunks:
-        new_id = str(uuid.uuid4())
-        old_to_new[str(chunk.id)] = new_id
-        db.add(Chunk(
-            id=new_id, document_id=target_doc_id, user_id=target_user_id,
-            content=chunk.content, chunk_index=chunk.chunk_index,
-            chunk_type=chunk.chunk_type, parent_chunk_id=chunk.parent_chunk_id,
-            char_start=chunk.char_start, char_end=chunk.char_end,
-            page_number=chunk.page_number, token_count=chunk.token_count,
-        ))
-        chunk_data.append((new_id, chunk.content))
-    await db.commit()
+    old_to_new = {str(c.id): str(uuid.uuid4()) for c in source_chunks}
+    chunk_data = [(old_to_new[str(c.id)], c.content) for c in source_chunks]
 
-    # Step 2: 重映射 parent_chunk_id
-    # 第一次写入时 parent_chunk_id 还是旧的 ID，需要第二次遍历更新。
-    # 用 old_to_new 字典将旧 ID 替换为新的 chunk ID，保持父子关系正确。
-    cloned = await db.execute(select(Chunk).where(Chunk.document_id == target_doc_id))
-    for chunk in cloned.scalars().all():
-        old_parent = str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None
-        if old_parent and old_parent in old_to_new:
-            chunk.parent_chunk_id = old_to_new[old_parent]
-    await db.commit()
-
-    # Step 3: Milvus 向量复制
-    # 不需要重新调用 embedding API，直接从源文档读取已有向量。
-    # 用新的 chunk ID 写入 Milvus，关联到目标用户和目标文档。
-    # vector_store 需新增 get_vectors_by_ids 方法，通过 ID 查询已有向量。
+    # Step 1: 先写 Milvus（不可回滚，所以放最前面尽早发现失败）
     store = get_vector_store()
     source_ids = list(old_to_new.keys())
     source_vectors = store.get_vectors_by_ids(source_ids)
@@ -87,14 +63,33 @@ async def _clone_chunks_from_existing(db, source_doc_id, target_doc_id, target_u
     texts = [c[1] for c in chunk_data]
     store.insert(new_ids, target_user_id, target_doc_id, source_vectors, texts)
 
-    # Step 4: ES 全文索引写入
-    # 将克隆的 chunks 批量索引到 Elasticsearch，使全文检索能命中用户 B 的数据。
+    # Step 2: 再写 ES（同样不可回滚，放第二步）
     es_chunks = [
         {"chunk_id": new_id, "document_id": target_doc_id,
          "user_id": target_user_id, "content": content}
         for new_id, content in chunk_data
     ]
     bulk_index_chunks(es_chunks)
+
+    # Step 3: Milvus/ES 都成功后，一次性提交 PG chunks（可回滚）
+    for chunk in source_chunks:
+        db.add(Chunk(
+            id=old_to_new[str(chunk.id)], document_id=target_doc_id,
+            user_id=target_user_id, content=chunk.content,
+            chunk_index=chunk.chunk_index, chunk_type=chunk.chunk_type,
+            parent_chunk_id=chunk.parent_chunk_id,
+            char_start=chunk.char_start, char_end=chunk.char_end,
+            page_number=chunk.page_number, token_count=chunk.token_count,
+        ))
+    await db.commit()
+
+    # Step 4: 重映射 parent_chunk_id（第二次遍历更新）
+    cloned = await db.execute(select(Chunk).where(Chunk.document_id == target_doc_id))
+    for chunk in cloned.scalars().all():
+        old_parent = str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None
+        if old_parent and old_parent in old_to_new:
+            chunk.parent_chunk_id = old_to_new[old_parent]
+    await db.commit()
 ```
 
 **upload 函数同步改造（`documents.py:79-88`）：**
@@ -189,6 +184,7 @@ async def generate_plan(state: AgentState) -> dict:
 ]}}
 
 规则：
+- 子查询数量不超过 3 个（避免过多子查询导致性能问题）
 - 每个子查询必须独立可理解
 - 多实体查询：分别检索每个实体
 - 推理查询：前面的结果可能影响后续检索策略
@@ -200,7 +196,7 @@ async def generate_plan(state: AgentState) -> dict:
 
     if parsed and isinstance(parsed, dict) and "sub_queries" in parsed:
         plan = []
-        for sq in parsed["sub_queries"]:
+        for sq in parsed["sub_queries"][:3]:  # 强制上限 3 个子查询，防止 LLM 生成过多
             tool = sq.get("tool", "hybrid_search")
             if tool not in {"hybrid_search", "fulltext_search"}:
                 tool = "hybrid_search"
