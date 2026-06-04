@@ -1,7 +1,7 @@
 # knSpace 详细设计文档
 
 > 基于 4C/4G 腾讯云单实例部署的私有化 RAG + Agent 知识库系统。
-> v1.x 固定 RAG 管线已实现并运行；v2.0 在此基础上新增 LangGraph Agent 编排层，渐进式升级。
+> 全局内容池（ContentPool）实现跨用户数据去重和引用计数管理。
 > 本文档描述完整系统设计，与代码一一对应。
 
 ---
@@ -10,20 +10,21 @@
 
 ### 1.1 定位
 
-knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传文档（PDF/Word/Markdown/图片/网页），系统自动解析、分块、向量化，然后基于文档内容进行智能问答。v2.0 新增 Agent 层，复杂查询由 LangGraph 驱动动态规划、调用工具、反思重试。
+knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传文档（PDF/Word/Markdown/图片/网页），系统自动解析、分块、向量化，然后基于文档内容进行智能问答。系统内置 LangGraph Agent 编排层，复杂查询由 Agent 驱动动态规划、调用工具、反思重试。
 
 ### 1.2 核心能力
 
 - 多格式文档解析：PDF（PyMuPDF）、Word（python-docx）、Markdown、图片（OCR）、网页（Playwright）
 - 结构化父子分块：按标题层级分组，父 chunk 提供完整上下文，子 chunk 精确检索
+- 全局内容池去重：ContentPool + SHA256 引用计数，相同内容只存一份 text+vector
 - 混合检索：向量检索（Milvus）+ 全文检索（Elasticsearch）+ RRF 融合
 - 查询智能分析：规则引擎自动分类（keyword/semantic/compare/multi_hop），动态调整检索权重
 - 多轮对话指代消解：规则 + LLM 两级消解，支持"它""这个"等代词
 - 流式响应：SSE 实时推送 LLM token + 检索状态
-- 跨用户文档去重：相同文件只处理一次，其他用户克隆 chunk
-- **Agent 编排（v2.0）**：LangGraph 状态图驱动，意图分类→规划→工具执行→生成→反思闭环
-- **混合路由（v2.0）**：规则引擎分流，keyword/单轮 semantic → simple 走 v1.x，compare/multi_hop → complex 走 Agent
-- **降级机制（v2.0）**：系统过载 / Agent 超时(60s) / 运行时异常均可降级到 v1.x，SSE 流内降级带用户提示
+- 跨用户文档去重：相同文件只处理一次，其他用户通过 ref_count 克隆 chunk
+- Agent 编排：LangGraph 状态图驱动，意图分类→规划→工具执行→生成→反思闭环
+- 混合路由：规则引擎分流，简单查询走固定管线，复杂查询走 Agent
+- 降级机制：系统过载 / Agent 超时(60s) / 运行时异常均可降级到固定管线，SSE 流内降级带用户提示
 
 ### 1.3 技术栈
 
@@ -43,7 +44,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 | Reranker | SiliconFlow API | BAAI/bge-reranker-v2-m3 | 精排（云端 API） |
 | OCR | SiliconFlow API | DeepSeek-OCR | 图片文字识别（云端 API） |
 | LLM（生成） | OpenAI 兼容 API | glm-5.1-openai | 流式生成（云端 API） |
-| LLM（规划/反思） | OpenAI 兼容 API | glm-4.5-air | 轻量模型，规划 + 反思（意图分类当前为纯规则，未调用 LLM） |
+| LLM（规划/反思） | OpenAI 兼容 API | glm-4.5-air | 轻量模型，规划 + 反思 + 指代消解（意图分类为纯规则，未调用 LLM） |
 | 中文分词 | jieba | 0.42.1 | 全文检索分词 |
 | 监控 | Prometheus + Grafana | - | 指标采集 + 可视化 |
 
@@ -51,7 +52,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 
 4 核 AMD EPYC 7K62 / 4 GB 内存 / 40 GB SSD / 腾讯云轻量 4Mbps
 
-全部 AI 模型走云端 API，本地 reranker 已移除（防止 4G 机器 OOM）。LangGraph Runtime 为纯编排层 Python 对象。月成本约 43 元（API）+ 100 元（服务器），Agent 路径成本增量尚无线上数据验证。
+全部 AI 模型走云端 API，本地 reranker 已移除（防止 4G 机器 OOM）。LangGraph Runtime 为纯编排层 Python 对象。月成本约 43 元（API）+ 100 元（服务器）。
 
 ---
 
@@ -69,37 +70,38 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
                  │                                     │
                  │  ┌──────┐ ┌──────┐ ┌─────────────┐ │
                  │  │ Auth │ │ Doc  │ │   Chat API  │ │
-                 │  │ API  │ │ API  │ │ (v1+v2 统一) │ │
+                 │  │ API  │ │ API  │ │  (统一入口)  │ │
                  │  └──────┘ └──────┘ └──────┬──────┘ │
                  │                            │        │
                  │         ┌─────────────────▼──────┐ │
-                 │         │   Query Router (v2.0)  │ │ ← 意图分类，分流
-                 │         │  简单→v1.x  复杂→Agent   │ │
+                 │         │     Query Router       │ │ ← 意图分类，分流
+                 │         │  简单→固定管线  复杂→Agent│ │
                  │         └──┬─────────────────┬───┘ │
                  │            │                 │      │
                  │  ┌─────────▼──────┐  ┌──────▼────┐│
-                 │  │  v1.x 固定管线  │  │   Agent   ││ ← v2.0 核心新增
-                 │  │ (原封不动复用)  │  │ Controller││
-                 │  │                │  │ ┌────────┐││
-                 │  │ query_analyzer │  │ │LangGraph│││
-                 │  │ search→rerank  │  │ │Runtime  │││
-                 │  │ llm generate   │  │ └────────┘││
-                 │  │                │  │ ┌──────┐  ││
-                 │  │                │  │ │Tools │  ││ ← 包装 v1.x 服务
-                 │  │                │  │ └──────┘  ││
-                 │  └────────────────┘  └──────┬────┘│
+                 │  │   固定 RAG     │  │   Agent   ││
+                 │  │    管线        │  │ Controller││
+                 │  │               │  │ ┌────────┐││
+                 │  │ query_analyzer│  │ │LangGraph│││
+                 │  │ search→rerank │  │ │Runtime  │││
+                 │  │ llm generate  │  │ └────────┘││
+                 │  │               │  │ ┌──────┐  ││
+                 │  │               │  │ │Tools │  ││ ← 包装检索服务
+                 │  │               │  │ └──────┘  ││
+                 │  └───────────────┘  └──────┬────┘│
                  └──────────────────────────────┼────┘
                                                   │
               ┌───────────┬──────────────┬───────▼──────┐
               │           │              │              │
        ┌──────▼──┐  ┌────▼─────┐  ┌────▼─────┐  ┌────▼────┐
        │PostgreSQL│  │ Milvus   │  │   ES     │  │  Redis  │
-       │业务+状态 │  │Standalone│  │  8 jieba │  │缓存+状态│
+       │业务+内容 │  │Standalone│  │ 8 jieba  │  │缓存+状态│
+       │  池+状态 │  │ IVF_FLAT │  │ BM25全文 │  │         │
        └─────────┘  └──────────┘  └──────────┘  └─────────┘
        ┌───────────────────────────────────────────────────┐
-       │                  云端 API（需禁用本地 fallback）     │
-       │  轻量 LLM：glm-4.5-air（规划 + 反思）              │
-       │  大模型：glm-5.1-openai（最终生成）                 │
+       │                  云端 API                          │
+       │  轻量 LLM：glm-4.5-air（规划 + 反思 + 指代消解）  │
+       │  大模型：glm-5.1-openai（最终生成）                │
        │  原有 API：Embedding / Rerank / OCR                │
        └───────────────────────────────────────────────────┘
 ```
@@ -110,7 +112,7 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 |------|------|------|
 | Nginx | SSL 终结、限流 10r/s、SPA 静态资源 | 443/80 |
 | FastAPI | 所有业务 API、SPA fallback | 8000 |
-| PostgreSQL | 用户、文档、chunk、会话、标签、Agent 状态持久化 | 5432 |
+| PostgreSQL | 用户、文档、chunk、内容池、会话、标签、Agent 状态持久化 | 5432 |
 | Milvus Standalone | 向量存储 + COSINE 检索，IVF_FLAT 索引 | 19530 |
 | Elasticsearch 8.x | 全文检索，jieba 分词，content + content_jieba 双字段 | 9200 |
 | Redis | Embedding 缓存（7天TTL）、API 限流（100次/时）、Agent 热状态（1h TTL） | 6379 |
@@ -118,34 +120,42 @@ knSpace 是一个私有化部署的 RAG + Agent 知识库系统。用户上传�
 
 ### 2.3 文件清单
 
-#### v1.x 已实现
-
 ```
 app/
 ├── main.py                     # FastAPI 应用入口
 ├── config.py                   # Pydantic BaseSettings 配置
 ├── api/                        # 路由层
 │   ├── auth.py                 # 认证（注册/登录/JWT）
-│   ├── documents.py            # 文档上传/管理
-│   ├── chat.py                 # 智能问答（SSE）
+│   ├── documents.py            # 文档上传/管理（含跨用户克隆 + ref_count GC）
+│   ├── chat.py                 # 智能问答（SSE，含 Agent 路由分支）
 │   ├── conversations.py        # 会话管理
 │   ├── collections.py          # 收藏夹/标签
 │   └── eval.py                 # RAG 评估
 ├── models/                     # SQLAlchemy 模型
-│   ├── user.py, document.py, chunk.py, conversation.py
-│   ├── message.py, collection.py, tag.py, document_tag.py
+│   ├── user.py                 # 用户
+│   ├── document.py             # 文档
+│   ├── chunk.py                # 分块（content_hash FK → content_pool）
+│   ├── content_pool.py         # 全局内容池（SHA256 PK + text + vector + ref_count）
+│   ├── conversation.py         # 会话
+│   ├── message.py              # 消息（含 agent_trace JSONB）
+│   ├── collection.py           # 收藏夹
+│   ├── tag.py                  # 标签
+│   ├── document_tag.py         # 文档标签关联
+│   └── agent_checkpoint.py     # Agent 状态持久化（表结构已定义，功能待实现）
 ├── schemas/                    # Pydantic 请求/响应 Schema
+│   └── chat.py                 # ChatRequest（含 use_agent 字段）
 ├── services/                   # 业务服务层
-│   ├── doc_processor.py        # 文档处理管线（解析→分块→向量化）
+│   ├── doc_processor.py        # 文档处理管线（解析→分块→向量化→content_pool 去重）
+│   ├── content_gc.py           # 内容池垃圾回收（ref_count≤0 时清理三引擎冗余）
 │   ├── parser.py               # 多格式解析
 │   ├── chunking.py             # 结构化父子分块
 │   ├── search.py               # 混合检索（Milvus + ES + RRF + Rerank）
 │   ├── query_analyzer.py       # 规则引擎查询分类
-│   ├── multi_turn.py           # 多轮对话指代消解
+│   ├── multi_turn.py           # 多轮对话指代消解（glm-4.5-air + httpx）
 │   ├── llm.py                  # LLM 流式生成
 │   ├── embedding.py            # Embedding 服务（Redis→API→Local→Dummy）
-│   ├── vector_store.py         # Milvus 向量存储
-│   ├── es.py                   # Elasticsearch 全文检索
+│   ├── vector_store.py         # Milvus 向量存储（含 content_hash + insert_batch）
+│   ├── es.py                   # Elasticsearch 全文检索（含 content_hash keyword）
 │   ├── ocr.py                  # OCR 服务
 │   ├── web_scraper.py          # 网页抓取
 │   ├── tokenizer.py            # jieba 中文分词
@@ -155,33 +165,17 @@ app/
 │   ├── evaluator.py            # RAG 评估
 │   ├── metrics.py              # Prometheus 指标
 │   └── factory.py              # 7 个 Protocol 接口 + 工厂方法
+├── agent/                      # Agent 编排层
+│   ├── __init__.py
+│   ├── state.py                # AgentState TypedDict 状态定义
+│   ├── graph.py                # LangGraph 状态图构建
+│   ├── nodes.py                # 6 个节点（分类/规划/执行/生成/反思/调参）
+│   ├── tools.py                # 工具注册，包装检索服务
+│   ├── router.py               # 查询路由（简单→固定管线，复杂→Agent）
+│   └── degrade.py              # 降级判断逻辑（CPU/内存水位检测）
 └── utils/
     └── security.py             # JWT + bcrypt
 ```
-
-#### v2.0 新增（`app/agent/`）
-
-```
-app/agent/                      ← 整个目录为 v2.0 新增
-├── __init__.py
-├── state.py                    # AgentState TypedDict 状态定义
-├── graph.py                    # LangGraph 状态图构建
-├── nodes.py                    # 6 个节点（分类/规划/执行/生成/反思/调参）
-├── tools.py                    # 工具注册，包装 v1.x 服务
-├── router.py                   # 查询路由（简单→v1.x，复杂→Agent）
-└── degrade.py                  # 降级判断逻辑（CPU/内存水位检测）
-
-app/models/agent_checkpoint.py  # 表结构已定义，Checkpoint 功能待实现
-app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
-```
-
-#### v2.0 最小改动（仅 3 个文件约 20 行）
-
-| 文件 | 改动 |
-|------|------|
-| `app/api/chat.py` | 新增 `use_agent` 分支，调用 `agent.router.route_query()` |
-| `app/schemas/chat.py` | `ChatRequest` 新增 `use_agent: bool = False` |
-| `app/config.py` | 新增 Agent 相关配置项 |
 
 ### 2.4 内存预算
 
@@ -191,10 +185,9 @@ app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
 | PostgreSQL 16 | 310 MB | shared_buffers=128MB + checkpoint |
 | Elasticsearch 8.x | 600 MB | 单节点，1 shard |
 | Milvus Standalone | 500 MB | Docker，IVF_FLAT |
-| FastAPI + 业务代码 | 200 MB | 含所有业务代码 |
+| FastAPI + 业务代码 | 200 MB | 含所有业务代码 + LangGraph |
 | Redis | 60 MB | 缓存 + 限流 + Agent 热状态 |
 | Nginx | 20 MB | 反向代理 |
-| **LangGraph Runtime** | **<30 MB** | 纯编排层 |
 | **常驻合计** | **~2.2 GB** | |
 | **剩余可用** | **~1.8 GB** | 连接池 + 请求缓冲 |
 
@@ -205,7 +198,7 @@ app/schemas/chat.py             # ChatRequest 新增 use_agent 字段
 ### 3.1 ER 关系
 
 ```
-users ──1:N──> documents ──1:N──> chunks
+users ──1:N──> documents ──1:N──> chunks ──N:1──> content_pool (全局唯一内容)
   │               │
   │               └── N:M ──> tags (via document_tags)
   │
@@ -215,7 +208,8 @@ users ──1:N──> documents ──1:N──> chunks
   │
   └──1:N──> chunks
 
-agent_checkpoints (v2.0 新增，thread_id = conversation_id)
+content_pool: 全局去重中心，相同内容只存一份（text + vector），通过 ref_count 管理生命周期
+agent_checkpoints: Agent 状态持久化（thread_id = conversation_id，功能待实现）
 ```
 
 ### 3.2 表结构
@@ -278,19 +272,30 @@ CREATE TABLE documents (
     updated_at        TIMESTAMPTZ DEFAULT now()
 );
 
+-- 全局内容池 (app/models/content_pool.py)
+CREATE TABLE content_pool (
+    content_hash    CHAR(64) PRIMARY KEY,       -- SHA256(content), 全局唯一去重键
+    content         TEXT NOT NULL,               -- 原始文本（全局只存一份）
+    vector          BYTEA NOT NULL,              -- 向量二进制序列化（全局只存一份）
+    ref_count       INT NOT NULL DEFAULT 1,      -- 引用计数：多少 Chunk 引用此内容
+    token_count     INT NOT NULL,                -- 近似 token 数
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_content_pool_ref_count ON content_pool(ref_count);
+
 -- 分块 (app/models/chunk.py)
 CREATE TABLE chunks (
     id              UUID PRIMARY KEY,
     document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     user_id         UUID NOT NULL REFERENCES users(id),
-    content         TEXT NOT NULL,
+    content_hash    CHAR(64) NOT NULL REFERENCES content_pool(content_hash),
     chunk_index     INT NOT NULL,
     chunk_type      VARCHAR(20) DEFAULT 'child',
     parent_chunk_id UUID,
     char_start      INT,
     char_end        INT,
     page_number     INT,
-    token_count     INT NOT NULL,
     metadata        JSON DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -319,7 +324,7 @@ CREATE TABLE messages (
     model_name      VARCHAR(50),
     feedback        VARCHAR(20),
     token_usage     JSON,
-    agent_trace     JSONB,          -- v2.0 设计中新增，SQLAlchemy 模型中尚未添加
+    agent_trace     JSONB,          -- Agent 执行追踪数据
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -339,7 +344,7 @@ CREATE TABLE document_tags (
     PRIMARY KEY (document_id, tag_id)
 );
 
--- Agent 状态持久化 (v2.0 新增)
+-- Agent 状态持久化（功能待实现）
 CREATE TABLE agent_checkpoints (
     thread_id      VARCHAR(36) PRIMARY KEY,   -- = conversation_id
     checkpoint_id  VARCHAR(36) NOT NULL,
@@ -355,7 +360,8 @@ CREATE TABLE agent_checkpoints (
 - **JSON 元数据**：documents.metadata、chunks.metadata、users.settings 使用 JSON 字段，避免频繁加列
 - **软删除**：documents、collections、conversations 使用 `is_deleted` 而非物理删除
 - **所有查询强制带 user_id**：为未来 PostgreSQL RLS 做准备
-- **v2.0 零数据迁移**：设计上只新增 `agent_checkpoints` 表和 `messages.agent_trace` 列，不修改任何 v1.x 表结构。注意：`agent_trace` 列目前仅在设计文档 DDL 中定义，SQLAlchemy 模型中尚未添加
+- **ContentPool 全局去重**：chunks 表通过 `content_hash` 外键指向 `content_pool`，不存原文。相同内容（SHA256 匹配）只存一份 text+vector，通过 `ref_count` 引用计数管理生命周期。删除文档时递减 ref_count，ref_count≤0 时触发 GC 清理 Milvus/ES 冗余数据
+- **三引擎 content_hash 贯穿**：PG（content_pool PK）→ Milvus（content_hash 字段）→ ES（content_hash keyword），通过 hash 关联实现跨引擎数据一致性
 
 ---
 
@@ -376,10 +382,10 @@ CREATE TABLE agent_checkpoints (
 
 | 方法 | 路径 | 功能 | 认证 |
 |------|------|------|------|
-| POST | `/upload` | 上传文件（multipart/form-data） | JWT |
+| POST | `/upload` | 上传文件（multipart/form-data），支持跨用户去重 | JWT |
 | GET | `/` | 列出文档（分页，可按 collection 过滤） | JWT |
 | GET | `/{doc_id}` | 获取文档详情 | JWT |
-| DELETE | `/{doc_id}` | 删除文档（清理 Milvus + ES + 文件） | JWT |
+| DELETE | `/{doc_id}` | 删除文档（清理 Milvus + ES + content_pool GC + 文件） | JWT |
 | GET | `/{doc_id}/status` | 查询处理状态 | JWT |
 | GET | `/{doc_id}/status/stream` | SSE 流式查询处理状态（5 分钟超时） | JWT |
 | POST | `/import-url` | 导入网页（scrape → chunk → embed） | JWT |
@@ -388,7 +394,7 @@ CREATE TABLE agent_checkpoints (
 
 | 方法 | 路径 | 功能 | 认证 |
 |------|------|------|------|
-| POST | `/` | 智能问答（SSE 流式返回）。`use_agent=false` 走 v1.x 管线，`true` 走 Agent | JWT |
+| POST | `/` | 智能问答（SSE 流式返回）。`use_agent=false` 走固定管线，`true` 走 Agent | JWT |
 
 **请求体**：`{ query, conversation_id?, collection_id?, history?, use_agent? }`
 
@@ -442,13 +448,13 @@ CREATE TABLE agent_checkpoints (
         ▼
  ┌──────────────┐
  │ 1. 读取文件   │  支持 PDF/Word/Markdown/图片/网页
- │    SHA-256    │
+ │    SHA-256    │  计算 document 级 content_hash
  └──────┬───────┘
         │
         ▼
  ┌──────────────┐
  │ 2. 去重检查   │  先查 user 内 content_hash，再查跨用户
- │              │  跨用户命中 → 克隆 chunk（共享向量）
+ │              │  跨用户命中 → 克隆 chunk（ref_count+1，向量复用）
  └──────┬───────┘
         │
         ▼
@@ -468,14 +474,15 @@ CREATE TABLE agent_checkpoints (
  │  chunking    │  chunking.py → 结构化父子分块（按标题层级）
  │    │         │
  │    ▼         │
- │  ES index    │  es.py → bulk_index_chunks（jieba 分词）
+ │  content_pool│  对每个 chunk 计算 SHA256(content_hash)
+ │  去重写入    │  hash 已存在 → ref_count+1（跳过 embedding）
+ │    │         │  hash 不存在 → 插入 text+vector 到 content_pool
+ │    ▼         │
+ │  ES index    │  es.py → bulk_index_chunks（带 content_hash）
  │    │         │  失败 → 回退 PG FTS (to_tsvector)
  │    ▼         │
- │  embedding   │  embedding.py → batch 64 → SiliconFlow API
- │    │         │  回退链: Redis缓存 → API → Local → Dummy
- │    ▼         │
- │  Milvus      │  vector_store.py → insert (IVF_FLAT, COSINE)
- │    │         │
+ │  Milvus      │  vector_store.py → insert_batch（带 content_hash）
+ │    │         │  向量来源：content_pool 序列化 BYTEA
  │    ▼         │
  │  ready       │  Document.status = ready, chunk_count 更新
  └──────────────┘
@@ -484,22 +491,60 @@ CREATE TABLE agent_checkpoints (
 ### 5.2 状态机
 
 ```
-pending → parsing → chunking → embedding → ready
-                │          │          │
-                └──────────┴──────────┘→ failed (processing_error 记录原因)
+pending → parsing → chunking → content_pool去重 → embedding → Milvus/ES写入 → ready
+                │          │            │            │               │
+                └──────────┴────────────┴────────────┴───────────────┘→ failed
+
+pending → cloning → ready  (跨用户去重克隆路径，失败 → failed)
 ```
 
 ### 5.3 关键设计
 
 - **批量 Embedding**: 每 64 个 chunk 一批调用 API，减少请求次数
-- **ES → PG FTS 回退**: Elasticsearch 不可用时自动回退到 PostgreSQL 全文检索（jieba 分词 + `to_tsvector`）
+- **ES → PG FTS 回退**: Elasticsearch 不可用时自动回退到 PostgreSQL 全文检索（jieba 分词 + `to_tsvector`），同时自动降低 bm25_weight×0.5 补偿向量检索权重
 - **父子分块**: 父 chunk 按标题分组提供完整段落上下文，子 chunk 精确检索；检索时自动附带 `parent_content`
+- **ContentPool 全局去重**: 每个 chunk 文本计算 SHA256 得到 `content_hash`，写入 content_pool 前检查 hash 是否已存在。命中则 `ref_count+1`（跳过 embedding 和存储），未命中则插入 text+vector 到 content_pool。Chunk 表只存 `content_hash` 外键，不存原文。检索时通过 JOIN content_pool 获取内容
+- **跨用户克隆原子性**: 克隆流程通过 JOIN Chunk+ContentPool 获取源数据，增量 ref_count，插入元数据级 Chunk，从 content_pool 反序列化向量写入 Milvus/ES。顺序："先写 Milvus/ES → 再提交 PG → 最后标 ready"。向量从 content_pool 复用（无需重新 embedding），parent_chunk_id 正确重映射
+- **删除 + GC**: 删除文档时：清理 Milvus/ES → 删除 chunks → 递减 content_pool ref_count → ref_count≤0 时删除 content_pool 条目。`content_gc.py` 提供独立 GC 入口，清理孤立 Milvus/ES 数据
+
+### 5.4 三引擎数据写入流程
+
+```
+                  chunk 文本 + 向量
+                        │
+          ┌─────────────┼─────────────┐
+          │             │             │
+          ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │PostgreSQL│  │  Milvus  │  │   ES     │
+   │content_  │  │ 向量检索  │  │ BM25全文  │
+   │  pool    │  │  索引     │  │  索引     │
+   │──────────│  │──────────│  │──────────│
+   │content_  │  │chunk_id  │  │chunk_id  │
+   │ hash(PK) │  │user_id   │  │user_id   │
+   │content   │  │document_ │  │document_ │
+   │ vector   │  │   id     │  │   id     │
+   │ref_count │  │content_  │  │content_  │
+   │token_    │  │  hash    │  │  hash    │
+   │  count   │  │ vector   │  │ content  │
+   │          │  │ snippet  │  │ content_ │
+   │          │  │          │  │  jieba   │
+   └──────────┘  └──────────┘  └──────────┘
+        │              │              │
+        └────── content_hash 贯穿 ──────┘
+```
+
+**数据一致性保证**：
+- PG 是权威数据源（content_pool 存原文+向量，chunks 存元数据）
+- Milvus/ES 是索引层，通过 content_hash 与 PG 关联
+- 写入顺序：PG（content_pool + chunks）→ Milvus → ES
+- 删除顺序：Milvus → ES → chunks → content_pool（ref_count GC）
 
 ---
 
 ## 6. 智能问答管线
 
-### 6.1 v1.x 固定管线（默认路径）
+### 6.1 固定 RAG 管线（`use_agent=false`，默认路径）
 
 ```
 POST /api/v1/chat  { query, conversation_id?, collection_id?, use_agent: false }
@@ -521,7 +566,7 @@ POST /api/v1/chat  { query, conversation_id?, collection_id?, use_agent: false }
       │
       ▼
  ┌─────────────────┐
- │ 指代消解        │  multi_turn.py — 规则替换 + 历史上下文拼接
+ │ 指代消解        │  multi_turn.py — 规则替换 + 轻量LLM(glm-4.5-air) 消解
  └────┬────────────┘
       │
       ▼
@@ -534,6 +579,7 @@ POST /api/v1/chat  { query, conversation_id?, collection_id?, use_agent: false }
       ▼
  ┌─────────────────┐
  │ 混合检索        │  search.py — 向量(Milvus) + 全文(ES) → RRF融合 → top40
+ │                 │  _fetch_chunks() JOIN content_pool 获取文本内容
  └────┬────────────┘
       │
       ▼
@@ -562,7 +608,7 @@ POST /api/v1/chat  { query, conversation_id?, collection_id?, use_agent: false }
  └─────────────────┘
 ```
 
-### 6.2 v2.0 Agent 管线（`use_agent=true`）
+### 6.2 Agent 管线（`use_agent=true`）
 
 ```
 POST /api/v1/chat  { query, use_agent: true }
@@ -570,37 +616,38 @@ POST /api/v1/chat  { query, use_agent: true }
         ▼
  ┌─────────────────┐
  │ Query Router    │  router.py — 判断是否降级
- │ should_degrade? │  degrade.py: CPU>80% / MEM>85% → 降级到 v1.x（带用户通知）
+ │ should_degrade? │  degrade.py: CPU>80% / MEM>85% → 降级到固定管线（带用户通知）
  └────┬────────────┘
       │ 正常
       ▼
  ┌─────────────────────┐
- │ 指代消解             │  #1: resolve_query_with_history — 规则+LLM 两级消解
+ │ 指代消解             │  resolve_query_with_history — 规则+轻量LLM(glm-4.5-air) 两级消解
  │ resolved_query      │  消解后的 query 传入 graph，原始 query 保留在 original_query
  └────┬────────────────┘
       │
       ▼
  ┌─────────────────────┐
  │ graph.ainvoke()     │  asyncio.wait_for(timeout=60s)
- │  超时 → 流内降级v1.x │
+ │  超时 → 流内降级     │
  │                     │
  │  ┌────────────────┐ │
  │  │intent_classify │ │  节点1: 纯规则(query_analyzer) + Prometheus 指标
  │  │                │ │
- │  │ simple         │ │  keyword / 单轮 semantic → simple → 走 v1.x 检索
+ │  │ simple         │ │  keyword / 单轮 semantic → simple → 走固定管线检索
  │  │ complex        │ │  compare / multi_hop → complex
  │  └───┬────────┬───┘ │
  │      │simple  │complex
  │      ▼        ▼     │
  │  ┌────────┐ ┌─────────────┐
- │  │ v1.x   │ │generate_plan│  节点2: glm-4.5-air 生成工具调用计划
- │  │ 检索   │ │             │  JSON 解析 + 工具名白名单校验
- │  │+生成   │ │             │  fallback: 单步 hybrid_search
- │  │(END)   │ └───┬─────────┘
- │  └────────┘     │
- │            ┌────▼──────────┐
- │            │ execute_tools │  节点3: 执行计划中的工具
+ │  │ 固定   │ │generate_plan│  节点2: glm-4.5-air 生成子问题 DAG
+ │  │ 管线   │ │             │  LLM 输出带 depends_on 的子查询列表（上限3个）
+ │  │ 检索   │ │             │  _extract_json 三级容错 + 工具名白名单 + fallback
+ │  │+生成   │ └───┬─────────┘
+ │  │(END)   │     │
+ │  └────────┘┌────▼──────────┐
+ │            │ execute_tools │  节点3: 按 DAG 依赖顺序执行 + 增量上下文注入
  │            │               │  hybrid_search 复用 SearchService.search_with_weights()
+ │            │               │  零结果时自动 fallback fulltext_search 补检索
  │            └───┬───────────┘
  │                │
  │            ┌────▼──────────┐
@@ -609,8 +656,9 @@ POST /api/v1/chat  { query, use_agent: true }
  │                │
  │            ┌────▼──────────┐
  │            │   reflect     │  节点5: glm-4.5-air 校验答案
- │            │               │  传入 top5 chunk 原文（各300字）做事实校验
+ │            │               │  传入 top5 chunk 原文（_smart_truncate 按句子边界截断）
  │            │               │  分维度评分：relevance / groundedness / consistency
+ │            │               │  重试耗尽时保留最后评分（max_retries_exhausted）
  │            └───┬───────────┘
  │                │
  │        ┌───────┼──────────┐
@@ -618,16 +666,16 @@ POST /api/v1/chat  { query, use_agent: true }
  │        │       │ retry<N  │
  │        ▼       ▼          │
  │    ┌──────┐ ┌──────────┐  │
- │    │ END  │ │adjust_   │  │  节点6: 根据最低分维度选择调整策略
- │    │      │ │  params  │──┘  事实问题→降 vector_weight / 引用不足→扩 top_k
+ │    │ END  │ │adjust_   │  │  节点6: 策略升级（保守→中等→激进 by retry_count）
+ │    │      │ │  params  │──┘  事实问题→降 vector_weight / 激进→切 fulltext_search
  │    └──────┘ └──────────┘
  └─────────────────────┘
 
  异常处理（三层降级）:
- 1. SSE 构建前异常 → 返回降级 v1.x StreamingResponse（带通知）
- 2. graph 超时 60s → 流内降级 v1.x（带通知）
- 3. 流内其他异常 → 流内降级 v1.x（带通知）
- 反思耗尽 → answer 末尾追加质量警告
+ 1. SSE 构建前异常 → 返回降级 StreamingResponse（带通知）
+ 2. graph 超时 60s → 流内降级（带通知）
+ 3. 流内其他异常 → 流内降级（带通知）
+ 反思耗尽 → answer 末尾追加分级质量警告（_build_quality_warning 按评分维度差异化提示）
 ```
 
 ### 6.3 SSE 事件格式
@@ -637,7 +685,7 @@ POST /api/v1/chat  { query, use_agent: true }
 ```json
 {"type": "conversation", "conversation_id": "uuid"}
 {"type": "status", "message": "Searching..."}
-{"type": "agent_step", "tool": "agent|hybrid_search|...", "thought": "意图分析中...|检索到 N 个结果"}  // v2.0 Agent 专用
+{"type": "agent_step", "tool": "agent|hybrid_search|...", "thought": "意图分析中...|检索到 N 个结果"}
 {"type": "citations", "data": [{"chunk_id": "...", "score": 0.95, "snippet": "..."}]}
 {"type": "token", "content": "部分回答文本"}
 {"type": "done", "conversation_id": "uuid"}
@@ -701,6 +749,8 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 预处理：去除噪声词（"请问/帮我/告诉我"），去除语气词（"吗/呢/吧"）。
 
+分类优先级：当查询同时命中 `compare` 和 `multi_hop` 模式时，优先判定为 `multi_hop`（多实体+关系场景比纯 A vs B 更复杂，需多步检索策略）。
+
 ### 7.4 中文分词一致性
 
 写入与查询使用同一套 jieba 分词管线，确保分词结果一致：
@@ -716,20 +766,22 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 |------|------|------|--------|
 | Parser | `services/parser.py` | PDF(PyMuPDF) / Word(python-docx) / Markdown / 图片 / 网页(Playwright) 解析为统一 Section 列表 | — |
 | Chunking | `services/chunking.py` | 按标题层级结构化分块，生成 parent + child chunk | — |
+| DocProcessor | `services/doc_processor.py` | 文档处理管线编排：解析→分块→content_pool 去重→embedding→Milvus/ES 写入 | — |
 | Embedding | `services/embedding.py` | 文本→1024维向量 (BAAI/bge-m3) | Redis缓存 → SiliconFlow API → Local model → Dummy(零向量) |
-| VectorStore | `services/vector_store.py` | Milvus 向量存储 + COSINE 检索 | Milvus → 内存暴力搜索 |
-| ES | `services/es.py` | Elasticsearch 全文检索 + jieba 分词 + bulk 索引 | ES → PG FTS (to_tsvector) |
-| Search | `services/search.py` | 混合检索编排：查询分析→双通道→RRF融合→Rerank→fetch chunks。新增 `search_with_weights()` 供 Agent 工具层复用 | 向量/全文任一失败仍可用单通道 |
+| VectorStore | `services/vector_store.py` | Milvus 向量存储 + COSINE 检索。Schema 含 content_hash 字段，支持 `insert_batch()` 批量插入和 `get_vectors_by_hash()` 按 hash 查向量 | Milvus → 内存暴力搜索(PickleStore) |
+| ES | `services/es.py` | Elasticsearch 全文检索 + jieba 分词 + bulk 索引。Mapping 含 content_hash keyword 字段 | ES → PG FTS (to_tsvector) |
+| Search | `services/search.py` | 混合检索编排：查询分析→双通道→RRF融合→Rerank→fetch chunks。`_fetch_chunks()` 通过 JOIN content_pool 获取文本内容。ES 宕机时自动降低 bm25_weight×0.5 补偿向量检索权重。`search_with_weights()` 供 Agent 工具层复用 | 向量/全文任一失败仍可用单通道 |
+| ContentGC | `services/content_gc.py` | 内容池垃圾回收：清理 ref_count≤0 的 content_pool 条目及对应 Milvus/ES 冗余数据 | — |
 | QueryAnalyzer | `services/query_analyzer.py` | 纯规则查询分类(keyword/semantic/compare/multi_hop) + 改写 + 子查询拆分 | — |
-| MultiTurn | `services/multi_turn.py` | 规则指代消解（"它/这个"→历史实体）+ LLM 上下文拼接（使用主模型 glm-5.1-openai，非轻量模型） | 规则失败→原文透传 |
+| MultiTurn | `services/multi_turn.py` | 规则指代消解（"它/这个"→历史实体）+ LLM 上下文拼接（使用轻量模型 glm-4.5-air，httpx 直接调用） | 规则失败→LLM失败→原文透传 |
 | LLM | `services/llm.py` | OpenAI 兼容 SSE 流式生成 | API → 本地模型(预留) |
-| Rerank | `factory.py:RerankAdapter` | 精排重排序（本地 fallback 已移除，仅 API） | SiliconFlow API → 不排序 |
+| Rerank | `factory.py:RerankAdapter` | 精排重排序（仅 API，本地 fallback 已移除防止 OOM） | SiliconFlow API → 不排序 |
 | OCR | `services/ocr.py` | 图片文字识别 | SiliconFlow API → Tesseract(预留) |
 | WebScraper | `services/web_scraper.py` | Playwright 网页抓取 | Playwright → httpx 静态抓取 |
 | Cache | `services/cache.py` | Redis 缓存 + 滑动窗口限流(100次/时) | Redis 不可用→不限流 |
 | Guard | `services/guard.py` | Prompt 注入检测（正则规则） | — |
 | Citation | `services/citation.py` | 引用编号合法性验证，去除幻觉引用 | — |
-| Evaluator | `services/evaluator.py` | RAG 评估：Recall@5/10, MRR, NDCG@10 | — |
+| Evaluator | `services/evaluator.py` | RAG 评估：Recall@5/10, MRR, NDCG@10 + RRF 参数扫描 + ES/PG FTS 回退效果评估 | — |
 | Factory | `services/factory.py` | 7 个 Protocol 接口定义 + Adapter 类 + 工厂方法 | — |
 
 ---
@@ -738,13 +790,13 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 `app/services/factory.py` 定义 7 个 `typing.Protocol` 接口 + 对应的 Adapter 类和工厂方法。
 
-`VectorStoreBase` 的方法名已与实际实现对齐（`insert` / `search` / `delete_by_document`）。
+`VectorStoreBase` 的方法名已与实际实现对齐（`insert` / `search` / `delete_by_document`）。实际实现还包含 `get_vectors_by_ids` 方法（用于克隆操作），但未在 Protocol 中声明。
 
 **当前状态：Protocol 方法名已对齐，但存在两个问题：** (1) 调用方仍直接 import 具体模块（包括 Agent 工具层直接 import `vector_store.get_vector_store()` 而非通过 `factory.get_vector_store()`）。(2) `VectorStoreBase.search` 等方法在 Protocol 中声明为 `async def`，但实际实现（如 `MilvusStandaloneStore.search`）是同步方法。由于 Python Protocol 是 `runtime_checkable` 的鸭子类型检查，签名不完全匹配不会报错，但语义上不一致。
 
 | Protocol | 定义方法 | 实际实现方法 | 调用方是否走 Protocol |
 |----------|---------|-------------|---------------------|
-| `VectorStoreBase` | insert / search / delete_by_document | insert / search / delete_by_document | 否，4 处直接 import |
+| `VectorStoreBase` | insert / search / delete_by_document | insert / search / delete_by_document / get_vectors_by_ids / insert_batch | 否，直接 import |
 | `FullTextSearchBase` | search / index_chunk / delete_chunk | — | 否 |
 | `EmbeddingServiceBase` | encode / encode_query | encode / encode_query | 否 |
 | `RerankServiceBase` | rerank | rerank | 否 |
@@ -756,7 +808,7 @@ score(chunk) = Σ  weight / (RRF_K + rank + 1)
 
 ---
 
-## 10. Agent 架构详细设计（v2.0）
+## 10. Agent 架构详细设计
 
 ### 10.1 AgentState TypedDict
 
@@ -775,7 +827,7 @@ class AgentState(TypedDict):
     conversation_id: str
     collection_id: str | None
     intent: str                             # simple / complex
-    plan: list[dict]                        # 直接覆盖（无 reducer）
+    plan: list[dict]                        # 子问题 DAG，每项含 id/tool/args/depends_on
     tools_called: Annotated[list[dict], operator.add]   # 审计日志，只追加
     chunks: Annotated[list[dict], _replace_list]        # 每轮替换，无跨轮次重复
     context: str
@@ -787,10 +839,9 @@ class AgentState(TypedDict):
     error: str | None
 ```
 
-**已解决的问题：**
-- `chunks` 改用 `_replace_list` reducer（last-write-wins），每轮只保留最新检索结果
-- 新增 `original_query` 字段，保留用户原始输入用于展示
-- 新增 `reflection_scores` 字段，记录分维度评分
+- `chunks` 使用 `_replace_list` reducer（last-write-wins），每轮只保留最新检索结果
+- `original_query` 保留用户原始输入用于展示
+- `reflection_scores` 记录分维度评分
 
 ### 10.2 LangGraph 状态图
 
@@ -808,14 +859,14 @@ class AgentState(TypedDict):
                 │ simple     │ complex     │
                 ▼            ▼             │
         ┌──────────┐  ┌──────────┐        │
-        │ 走 v1.x  │  │generate_ │        │
+        │ 固定管线 │  │generate_ │        │
         │ 检索+生成│  │  plan    │        │
         │ (END)    │  │(轻量LLM) │        │
         └──────────┘  └────┬─────┘        │
                            │              │
                     ┌──────▼──────┐        │
                     │  execute_   │        │
-                    │   tools     │ ← 复用 SearchService.search_with_weights()
+                    │   tools     │ ← 按 DAG 顺序执行 + 增量上下文 + 零结果补检索
                     └──────┬──────┘        │
                            │              │
                     ┌──────▼──────┐        │
@@ -842,12 +893,16 @@ class AgentState(TypedDict):
 
 | 工具名 | 实现 | 功能 | 参数 |
 |--------|------|------|------|
-| `hybrid_search` | 调用 `SearchService.search_with_weights()` | 向量+全文混合检索（复用完整 v1.x 管线：查询改写→RRF→rerank） | query, user_id, collection_id, top_k(40), vector_weight(0.7), bm25_weight(0.3) |
+| `hybrid_search` | 调用 `SearchService.search_with_weights()` | 向量+全文混合检索（复用完整管线：查询改写→RRF→rerank） | query, user_id, collection_id, top_k(40), vector_weight(0.7), bm25_weight(0.3) |
 | `fulltext_search` | 调用 `SearchService._bm25_search()` | BM25 全文检索 | query, user_id, top_k(20) |
 
-`hybrid_search` 已改为复用 `SearchService.search_with_weights()`，零重复代码，查询改写步骤保留。
+`hybrid_search` 复用 `SearchService.search_with_weights()`，零重复代码，查询改写步骤保留。
 
-> **已知限制：** `collection_id` 参数虽被 `search_with_weights()` 接收，但内部未转发到 `_single_search()` 和 `_fetch_chunks()`，当前被静默忽略。Agent 搜索路径无法按收藏夹过滤，需后续补全。
+**generate_plan**：轻量 LLM（glm-4.5-air）生成子问题 DAG，输出带 `depends_on` 依赖关系的子查询列表，`execute_tools` 按 DAG 顺序执行并注入增量上下文。子查询上限 3 个，参数上限校验防止 LLM 生成超大值。
+
+**零结果补检索**：`execute_tools` 中 hybrid_search 返回 0 结果时，自动尝试 fulltext_search 补检索，并将原因记录到 `tools_called` 审计日志。
+
+**已知限制**：`collection_id` 参数虽被 `search_with_weights()` 接收，但内部未转发到 `_single_search()` 和 `_fetch_chunks()`，当前被静默忽略。Agent 搜索路径无法按收藏夹过滤，需后续补全。
 
 ### 10.4 Checkpoint 状态持久化
 
@@ -878,11 +933,11 @@ def should_degrade() -> bool:
 
 | 触发点 | 代码位置 | 行为 | 状态 |
 |--------|---------|------|------|
-| 系统过载 | `router.py:38-44` | SSE 构建前降级，发送 `agent_step` 降级通知 | ✅ 已实现 |
-| Agent 构建异常 | `router.py:46-54` | `except Exception` 兜底，发送降级通知 | ✅ 已实现 |
-| SSE 流内异常 | `router.py:364-390` | 流内降级：先发降级通知，再用 v1.x 逻辑检索生成 | ✅ 已实现 |
-| graph 超时(60s) | `router.py:276-308` | `asyncio.wait_for` 超时后流内降级到 v1.x | ✅ 已实现 |
-| 反思耗尽 | `router.py:342-344` | answer 末尾追加质量警告 `[注：此回答的质量校验未完成]` | ✅ 已实现 |
+| 系统过载 | `router.py` | SSE 构建前降级，发送 `agent_step` 降级通知 | ✅ |
+| Agent 构建异常 | `router.py` | `except Exception` 兜底，发送降级通知 | ✅ |
+| SSE 流内异常 | `router.py` | 流内降级：先发降级通知，再用固定管线检索生成 | ✅ |
+| graph 超时(60s) | `router.py` | `asyncio.wait_for` 超时后流内降级 | ✅ |
+| 反思耗尽 | `router.py` | answer 末尾追加分级质量警告（按最低分维度生成差异化提示） | ✅ |
 
 降级通知通过 SSE `agent_step` 事件发送（`tool: "system"`），前端可区分展示。
 
@@ -890,9 +945,9 @@ def should_degrade() -> bool:
 
 | 策略 | 状态 | 说明 |
 |------|------|------|
-| 轻量 LLM 中间步骤 | ✅ | 规划 + 反思用 glm-4.5-air；意图分类为纯规则零成本 |
-| Embedding 缓存 | ✅ | 复用 v1.x Redis 缓存层 |
-| 用户限流 | ✅ | v1.x 和 Agent 共享 100次/小时 |
+| 轻量 LLM 中间步骤 | ✅ | 规划 + 反思 + 指代消解用 glm-4.5-air；意图分类为纯规则零成本 |
+| Embedding 缓存 | ✅ | Redis 缓存层（7天TTL） |
+| 用户限流 | ✅ | 固定管线和 Agent 共享 100次/小时 |
 | 重试上限 | ✅ | `agent_max_retries=2`（总尝试 3 次） |
 | 本地 Reranker 禁用 | ✅ | 已移除本地 CrossEncoder fallback，防止 4G OOM |
 | httpx 连接池复用 | ✅ | `_get_http_client()` 单例复用 |
@@ -901,16 +956,14 @@ def should_degrade() -> bool:
 | 检索结果缓存 | ❌ | 未实现 |
 | Agent 独立限流 | ❌ | 未实现 |
 
-成本增量尚无线上数据验证。
-
 ---
 
 ## 11. 可观测性
 
-### 11.1 v1.x Prometheus 指标
+### 11.1 Prometheus 指标
 
-| 指标 | 类型 | 含义 | 是否已接入 |
-|------|------|------|-----------|
+| 指标 | 类型 | 含义 | 已接入 |
+|------|------|------|--------|
 | `rag_retrieval_duration_seconds` | Histogram | 混合检索总耗时 | ✅ |
 | `rag_results_count` | Histogram | Rerank 后结果数量 | ✅ |
 | `rag_rerank_duration_seconds` | Histogram | Rerank 耗时 | ✅ |
@@ -919,27 +972,35 @@ def should_degrade() -> bool:
 | `rerank_api_duration_seconds` | Histogram | Rerank API 调用耗时 | ✅ |
 | `ocr_api_duration_seconds` | Histogram | OCR API 调用耗时 | ✅ |
 | `api_error_total` | Counter | API 调用失败次数（按 service 标签） | ✅ |
-| `model_memory_bytes` | Gauge | 本地模型内存占用 | ❌ 已定义但未调用 `.set()` |
+| `model_memory_bytes` | Gauge | 本地模型内存占用 | ❌ 已定义未调用 |
+| `agent_execution_duration_seconds` | Histogram | Agent 总执行时长 | ✅ |
+| `agent_tool_call_duration_seconds` | Histogram | 单次工具调用时长 | ❌ 已定义未使用 |
+| `agent_retry_total` | Counter | 反思重试次数 | ✅ |
+| `agent_degrade_total` | Counter | 降级到固定管线次数 | ✅ |
+| `intent_classify_total` | Counter | 意图分类结果分布 | ✅ |
+| `intent_classify_duration_seconds` | Histogram | 意图分类耗时 | ✅ |
+| `agent_api_calls_total` | Counter | Agent API 调用次数 | ✅ |
+| `agent_reflection_scores` | Histogram | 反思评分分布（按 dimension 标签） | ✅ |
 
-### 11.2 v2.0 新增 Prometheus 指标
+### 11.2 Agent Trace
 
-| 指标 | 类型 | 含义 | 是否已接入 | 告警阈值 |
-|------|------|------|-----------|----------|
-| `agent_execution_duration_seconds` | Histogram | Agent 总执行时长 | ✅ | P95 > 2s |
-| `agent_tool_call_duration_seconds` | Histogram | 单次工具调用时长 | ❌ 已定义未使用 | P95 > 1s |
-| `agent_retry_total` | Counter | 反思重试次数 | ✅ reflect 节点触发时 `.inc()` | 1小时 > 100 |
-| `agent_degrade_total` | Counter | 降级到 v1.x 次数 | ✅ | 1小时 > 50 |
-| `intent_classify_total` | Counter | 意图分类结果分布 | ✅ `intent_classify` 节点内 `.inc()` | — |
-| `intent_classify_duration_seconds` | Histogram | 意图分类耗时 | ✅ | — |
-| `agent_api_calls_total` | Counter | Agent API 调用次数 | ✅ `_call_lightweight_llm` 内 `.inc()` | — |
+`messages` 表的 `agent_trace` JSONB 字段记录 Agent 执行追踪数据，`router.py` 在 Agent 执行完成后写入。
 
-### 11.3 Agent Trace
+Trace 数据结构：
 
-**当前状态：未实现。** `messages` 表的 `agent_trace` JSONB 字段仅在设计文档的 DDL 中定义，SQLAlchemy 模型（`app/models/message.py`）中尚未添加该列。需先完成数据库迁移（`alembic revision --autogenerate`）并添加模型字段后，才能在 `router.py` 中写入 trace 数据。
+```json
+{
+  "intent": "complex",
+  "plan_steps": 2,
+  "tools_called": [{"tool": "hybrid_search", "args": {...}, "result_count": 15}],
+  "reflection_result": "通过",
+  "reflection_scores": {"relevance": 4, "groundedness": 5, "consistency": 4},
+  "retry_count": 0,
+  "chunk_count": 15
+}
+```
 
-设计目标（待实现）：每条 Agent 执行记录完整过程，存储到 `messages.agent_trace` JSONB 字段，供离线分析和问题排查。
-
-### 11.4 告警规则
+### 11.3 告警规则
 
 | 规则 | 条件 | 动作 |
 |------|------|------|
@@ -969,6 +1030,7 @@ def should_degrade() -> bool:
 ### 12.2 数据隔离
 
 - **用户级隔离**: 所有查询强制带 `user_id` 条件（SQL WHERE + Milvus filter + ES filter）
+- **ContentPool 跨用户安全**: content_pool 存储全局内容但不暴露给用户直接查询，用户只能通过自己的 chunks → JOIN content_pool 获取内容
 - **Agent Checkpoint 绑定**: `agent_checkpoints.thread_id` 绑定 `conversation_id`，而 `conversations.user_id` 保证了用户隔离
 - **工具调用隔离**: 每个 Agent Tool 的 `_run` 方法内部校验 `user_id`，防止越权访问
 
@@ -1044,7 +1106,7 @@ LLM_API_URL=<your-endpoint>/v1
 LLM_API_KEY=<key>
 LLM_MODEL=glm-5.1-openai
 
-# ── Agent (v2.0) ──
+# ── Agent ──
 USE_AGENT=true
 AGENT_LIGHTWEIGHT_LLM=glm-4.5-air
 AGENT_MAX_RETRIES=2
@@ -1093,119 +1155,94 @@ docker run -d --name elasticsearch \
   docker.elastic.co/elasticsearch/elasticsearch:8.17.0
 ```
 
-### 13.4 v2.0 部署步骤
+### 13.4 部署步骤
 
 ```bash
-# 1. 安装新依赖
-pip install langgraph langchain-core langchain psutil
+# 1. 安装依赖
+pip install -r requirements.txt
 
-# 2. 数据库迁移（新增 agent_checkpoints 表；agent_trace 列待实现后迁移）
-alembic revision --autogenerate -m "add_agent_checkpoints"
+# 2. 数据库迁移
+#    包含：content_pool 表 + chunks 表改造(content_hash FK)
+#          + agent_checkpoints 表 + messages.agent_trace 列
 alembic upgrade head
 
-# 3. 配置 .env 新增 Agent 相关变量
-# 4. 重启服务（与 v1.x 完全相同）
+# 3. Milvus / ES Schema
+#    首次启动自动创建。如需升级 Schema：
+#    删除旧 collection/索引 → 应用启动时自动重建（含 content_hash 字段）
+
+# 4. 配置 .env
+cp .env.example .env
+# 编辑填入实际 API Key 和数据库连接
+
+# 5. 启动服务
 sudo systemctl restart knspace
 
-# 5. 验证 v1.x 接口正常（默认 use_agent=false）
+# 6. 验证
 curl http://localhost:8000/api/v1/auth/me -H "Authorization: Bearer <token>"
-
-# 6. 灰度开启 Agent（按用户 hash 比例控制）
-# 在 .env 中设置 USE_AGENT=true
 ```
 
 ---
 
-## 14. 演进路线
-
-| 版本 | 核心改动 | 架构影响 |
-|------|----------|----------|
-| **v1.x** (已上线) | 固定 RAG 管线：解析→分块→混合检索→Rerank→LLM 生成 | 单实例部署 |
-| **v2.0** (本次) | 新增 `app/agent/` LangGraph 编排层，混合路由，双层 Checkpoint | 无侵入，兼容 v1.x，新增 <50MB |
-| **v2.1** | Agent 无状态化，Redis Cluster 替换单机 Redis，水平扩展 | 可扩展至 100+ 实例 |
-| **v2.2** | 多 Agent 协作（检索 Agent + 写作 Agent + 审核 Agent） | 复杂任务拆分为 Agent 流水线 |
-| **v3.0** | Milvus Cluster、ES Cluster、PG 读写分离 | 支撑百万级用户 |
-
-**平滑设计保障**：
-
-- 接口兼容：`POST /api/v1/chat` 新增 `use_agent` 参数，默认 `false`
-- 组件可替换：基于 `factory.py` 的 7 个 Protocol 抽象，替换 Milvus/ES/LLM 时 Agent 层零改动
-- 数据零迁移：v2.0 只新增 `agent_checkpoints` 表，不修改任何 v1.x 表结构
-- 灰度能力：可按用户 ID hash 控制灰度比例（10% → 50% → 100%）
-
----
-
-## 15. 延迟预算
+## 14. 延迟预算
 
 | 路径 | 节点 | 目标延迟 |
 |------|------|----------|
-| v1.x 固定链路 | 注入检测→限流→指代消解→查询分析→混合检索→Rerank→LLM生成→引用校验 | <500ms |
-| Agent 简单路径 | 意图分类(规则预筛)→simple→降级到 v1.x | <500ms |
+| 固定 RAG 链路 | 注入检测→限流→指代消解→查询分析→混合检索→Rerank→LLM生成→引用校验 | <500ms |
+| Agent 简单路径 | 意图分类(规则预筛)→simple→固定管线检索+生成 | <500ms |
 | Agent 复杂路径 | 意图分类→规划→工具执行→生成→反思 | <1.5s |
 | Agent 重试路径 | 上述 + 1 次反思重试（adjust_params→execute_tools→generate→reflect） | <2.5s |
 
 ---
 
-## 16. 开发计划（v2.0 三周 MVP）
+## 15. 演进路线
 
-| 阶段 | 时间 | 任务 | 交付物 |
-|------|------|------|--------|
-| 第一周 | D1-D7 | `state.py` 状态定义 + `graph.py` 状态图 + `tools.py` 工具封装 + `nodes.py` 4个节点 | Agent 最小闭环可运行 |
-| 第二周 | D8-D14 | `checkpoint.py` 双层持久化 + `router.py` 混合路由 + `degrade.py` 降级 + `api/chat.py` 集成 | 完整链路联调通过 |
-| 第三周 | D15-D21 | `metrics` 新增 4 个指标 + `agent_trace` JSONB + 单元测试 + 集成测试 + 灰度上线 | 生产环境就绪 |
+| 版本 | 核心改动 | 架构影响 |
+|------|----------|----------|
+| 当前 | RAG + Agent + ContentPool 全局去重，单实例部署 | 4C/4G 单机 |
+| 下一步 | Agent 无状态化，Redis Cluster 替换单机 Redis，水平扩展 | 可扩展至 100+ 实例 |
+| 未来 | 多 Agent 协作（检索 Agent + 写作 Agent + 审核 Agent） | 复杂任务拆分为 Agent 流水线 |
+| 远期 | Milvus Cluster、ES Cluster、PG 读写分离 | 支撑百万级用户 |
 
-### 每日里程碑
+**平滑设计保障**：
 
-```
-D1  state.py + graph.py 骨架
-D2  nodes.py — intent_classification + generate_plan
-D3  tools.py — HybridSearchTool + FullTextSearchTool
-D4  nodes.py — execute_tools + generate_answer
-D5  nodes.py — reflect + 条件边
-D6  graph.py 串联 + 本地联调
-D7  第一周末检收：最小闭环跑通
-
-D8  checkpoint.py — DualCheckpointSaver
-D9  config.py 新增配置 + 数据库迁移
-D10 router.py — route_query + v1.x 降级
-D11 api/chat.py 集成 use_agent 分支
-D12 SSE 流式输出适配
-D13 多轮对话 + collection 过滤
-D14 第二周末检收：完整链路联调
-
-D15 metrics — 4 个新增 Prometheus 指标
-D16 agent_trace — messages 表新增 JSONB 列
-D17 单元测试（tools / nodes / checkpoint）
-D18 集成测试（端到端 Agent 流程）
-D19 压测 + 调优
-D20 灰度部署（10% 用户）
-D21 全量上线
-```
+- 接口兼容：`POST /api/v1/chat` 通过 `use_agent` 参数控制路由，默认 `false`
+- 组件可替换：基于 `factory.py` 的 7 个 Protocol 抽象，替换 Milvus/ES/LLM 时 Agent 层零改动
+- 灰度能力：可按用户 ID hash 控制灰度比例（10% → 50% → 100%）
 
 ---
 
-## 17. 设计现状总结
+## 16. 设计总结
 
 ### 已落地
 
-1. **渐进式架构演进**：v2.0 = v1.x + Agent 层。v1.x 的 16 个 service 模块原封不动复用，v2.0 新增 `app/agent/` 目录（6 个文件），改动量仅 3 个文件约 20 行代码。
+1. **LangGraph 状态图编排**：6 节点状态图（intent_classify → generate_plan → execute_tools → generate_answer → reflect → adjust_params），条件路由 + 重试循环，进程内执行零额外服务依赖。
 
-2. **LangGraph 状态图编排**：6 节点状态图（intent_classify → generate_plan → execute_tools → generate_answer → reflect → adjust_params），条件路由 + 重试循环，进程内执行零额外服务依赖。
+2. **LLM 子问题 DAG 生成**：generate_plan 使用轻量 LLM（glm-4.5-air）生成带依赖关系的子查询 DAG（上限 3 个），execute_tools 按 DAG 顺序执行 + 增量上下文注入 + 零结果自动补检索。
 
-3. **RRF 混合检索 + 规则查询分析**：向量检索 + BM25 全文检索 → RRF 融合 → Rerank 精排。纯规则查询分类器支持 keyword/semantic/compare/multi_hop 四种模式，零 LLM 调用成本。
+3. **RRF 混合检索 + 规则查询分析**：向量检索 + BM25 全文检索 → RRF 融合 → Rerank 精排。查询分类器支持 keyword/semantic/compare/multi_hop，multi_hop+compare 同时命中时优先 multi_hop。ES 宕机时自动降低 bm25_weight×0.5 补偿。
 
-4. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS）、Rerank（仅 API，本地 fallback 已移除防止 OOM）、VectorStore（Milvus→Pickle）。任何单点故障不影响系统可用性。
+4. **ContentPool 全局去重**：chunks 表通过 `content_hash` FK 指向 `content_pool`，相同内容（SHA256 匹配）只存一份 text+vector。引用计数 `ref_count` 管理生命周期：克隆 +1、删除 -1、ref_count≤0 时 GC 清理三引擎冗余数据。检索时 `_fetch_chunks()` JOIN content_pool 获取文本内容。三引擎通过 content_hash 贯穿（PG PK → Milvus field → ES keyword），实现跨引擎数据一致性。
 
-5. **结构化父子分块**：按标题层级分组，父 chunk 提供完整段落上下文，子 chunk 精确检索。检索结果自动附带 `parent_content`。
+5. **多层回退链**：Embedding（Redis→API→Local→Dummy）、FTS（ES→PG FTS + 动态权重补偿）、Rerank（仅 API，本地 fallback 已移除防止 OOM）、VectorStore（Milvus→Pickle）。任何单点故障不影响系统可用性。
+
+6. **结构化父子分块**：按标题层级分组，父 chunk 提供完整段落上下文，子 chunk 精确检索。检索结果自动附带 `parent_content`。
+
+7. **跨用户克隆原子性**：克隆流程通过 JOIN Chunk+ContentPool 获取源数据，增量 ref_count，插入元数据级 Chunk，从 content_pool 反序列化向量写入 Milvus/ES。顺序："Milvus/ES first → PG second → mark ready"，失败时标记文档 failed。
+
+8. **反思质量分级 + 策略升级**：reflect 节点按句子边界截断（`_smart_truncate`），重试耗尽保留评分。adjust_params 根据重试轮次升级策略（保守→中等→激进）。质量警告按最低分维度差异化提示（`_build_quality_warning`）。
+
+9. **可观测性**：Prometheus 指标覆盖意图分类、反思评分（`agent_reflection_scores` Histogram）、API 调用计数。Agent 执行 trace 写入 `messages.agent_trace` JSONB 列供离线分析。评估框架支持 RRF 参数扫描和 ES/PG FTS 回退效果对比。
+
+10. **轻量模型统一**：multi_turn 指代消解、Agent 规划、Agent 反思统一使用 glm-4.5-air + httpx 直接调用，不再走 LLMService 主模型。
 
 ### 待优化（详见 OPTIMIZATION-PLAN.md）
 
-6. **Protocol 接口层**：方法名已对齐，但调用方仍直接 import 具体模块，未通过工厂方法。需编写参数化测试后才能保证替换安全。
+11. **Protocol 接口层**：方法名已对齐，但调用方仍直接 import 具体模块，未通过工厂方法。需编写参数化测试后才能保证替换安全。
 
-7. **成本可观测性**：`agent_api_calls_total` 已接入，但缺少 token 成本指标和按路径拆分的成本 dashboard。
+12. **成本可观测性**：`agent_api_calls_total` 已接入，但缺少 token 成本指标和按路径拆分的成本 dashboard。
 
-8. **规划缓存 / 检索结果缓存**：设计文档提到的规划缓存（Redis TTL=1d）和检索结果缓存均未实现。
+13. **规划缓存 / 检索结果缓存**：规划缓存（Redis TTL=1d）和检索结果缓存均未实现。
 
-9. **Agent 独立限流**：v1.x 和 Agent 共享同一限流桶，缺少 Agent 路径的独立并发控制。
+14. **Agent 独立限流**：固定管线和 Agent 共享同一限流桶，缺少 Agent 路径的独立并发控制。
 
-10. **Checkpoint 状态持久化**：表结构已定义，`app/agent/checkpoint.py` 未实现。
+15. **Checkpoint 状态持久化**：表结构已定义，`app/agent/checkpoint.py` 未实现。
