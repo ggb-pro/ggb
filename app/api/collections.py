@@ -1,6 +1,6 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func
+from sqlalchemy import select, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import get_db
@@ -26,8 +26,9 @@ async def list_collections(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    uid = str(user.id)
     stmt = select(Collection).where(
-        Collection.user_id == str(user.id),
+        Collection.user_id == func.cast(uid, String),
         Collection.is_deleted == False,
     )
     if parent_id:

@@ -1,9 +1,10 @@
-"""Search service: hybrid search (vector + BM25) + RRF fusion + rerank + query understanding."""
+"""Search service: hybrid search (vector + BM25) + weighted RRF fusion + rerank."""
 
 import logging
 import time
+import numpy as np
 from sqlalchemy import select, text, func
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import get_settings
 from app.deps import engine
@@ -11,19 +12,62 @@ from app.models.chunk import Chunk
 from app.services.embedding import embed_query
 from app.services.vector_store import get_vector_store
 from app.services.query_analyzer import QueryAnalyzer
-from app.services.metrics import rag_retrieval_duration, rag_rerank_duration, rag_results_count
+from app.services.metrics import rag_retrieval_duration, rag_rerank_duration, rag_results_count, rag_data_loss
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 RRF_K = 60
-CANDIDATE_TOP_K = 40  # candidates before rerank (was 20)
-RERANK_TOP_K = 10  # final results after rerank (was 5)
+CANDIDATE_TOP_K = 40
+RERANK_TOP_K = 10
 
 _analyzer = QueryAnalyzer()
 
 
 class SearchService:
+    async def search_with_weights(
+        self,
+        query: str,
+        user_id: str,
+        top_k: int = CANDIDATE_TOP_K,
+        collection_id: str | None = None,
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+    ) -> list[dict]:
+        """Search with custom weights, reusing full pipeline."""
+        t0 = time.monotonic()
+        try:
+            analyzed = await _analyzer.analyze(query)
+            search_query = analyzed.rewritten
+            fused = await self._single_search(search_query, user_id, top_k, vector_weight, bm25_weight)
+
+            if not fused:
+                self._check_data_loss(query, user_id)
+                return []
+
+            chunk_ids = list(fused.keys())
+            chunks_map = await self._fetch_chunks(chunk_ids, user_id)
+
+            results = []
+            for cid, score in fused.items():
+                chunk = chunks_map.get(cid)
+                if chunk:
+                    results.append({
+                        "chunk_id": cid,
+                        "document_id": chunk["document_id"],
+                        "score": score,
+                        "content": chunk["content"],
+                        "page_number": chunk.get("page_number"),
+                        "parent_content": chunk.get("parent_content"),
+                    })
+
+            results.sort(key=lambda x: x["score"], reverse=True)
+            candidates = results[:CANDIDATE_TOP_K]
+            reranked = await self._rerank(search_query, candidates)
+            return reranked[:RERANK_TOP_K]
+        finally:
+            rag_retrieval_duration.observe(time.monotonic() - t0)
+
     async def search(
         self,
         query: str,
@@ -42,13 +86,11 @@ class SearchService:
         self, query: str, user_id: str, top_k: int,
         collection_id: str | None, history: list[str] | None,
     ) -> list[dict]:
-        # Step 0: Query analysis
-        analyzed = _analyzer.analyze(query, history=history)
+        analyzed = await _analyzer.analyze(query, history=history)
         search_query = analyzed.rewritten
         vector_weight = analyzed.vector_weight
         bm25_weight = analyzed.bm25_weight
 
-        # Step 1: Search (for compare/decompose, merge sub-query results)
         if len(analyzed.sub_queries) > 1:
             all_fused = {}
             for sq in analyzed.sub_queries:
@@ -60,9 +102,9 @@ class SearchService:
             fused = await self._single_search(search_query, user_id, top_k, vector_weight, bm25_weight)
 
         if not fused:
+            self._check_data_loss(query, user_id)
             return []
 
-        # Step 2: Fetch full chunk content
         chunk_ids = list(fused.keys())
         chunks_map = await self._fetch_chunks(chunk_ids, user_id)
 
@@ -82,7 +124,6 @@ class SearchService:
         results.sort(key=lambda x: x["score"], reverse=True)
         candidates = results[:CANDIDATE_TOP_K]
 
-        # Step 3: Rerank
         reranked = await self._rerank(search_query, candidates)
         result = reranked[:RERANK_TOP_K]
         rag_results_count.observe(len(result))
@@ -92,11 +133,24 @@ class SearchService:
         self, query: str, user_id: str, top_k: int,
         vector_weight: float, bm25_weight: float,
     ) -> dict[str, float]:
-        """Run vector + BM25 search and RRF fuse with given weights."""
+        """Run vector + BM25 search and weighted RRF fuse."""
         query_vector = await embed_query(query)
         store = get_vector_store()
         vector_results = store.search(query_vector, user_id, top_k=top_k)
-        bm25_results = await self._bm25_search(query, user_id, top_k)
+
+        try:
+            from app.services.es import search as es_search
+            bm25_results = es_search(query, user_id, top_k)
+            using_pg_fts = False
+        except Exception as e:
+            logger.warning(f"ES search failed, falling back to PG FTS: {e}")
+            bm25_results = await self._pg_fts_search(query, user_id, top_k)
+            using_pg_fts = True
+
+        if using_pg_fts and bm25_results:
+            bm25_weight *= 0.5
+            vector_weight = 1.0 - bm25_weight
+
         return self._rrf_fuse(vector_results, bm25_results, vector_weight, bm25_weight)
 
     def build_context(self, results: list[dict], max_tokens: int = 8000) -> str:
@@ -118,21 +172,26 @@ class SearchService:
         vector_weight: float = 0.7,
         bm25_weight: float = 0.3,
     ) -> dict[str, float]:
-        """Reciprocal Rank Fusion of vector and BM25 results."""
+        """D4: Weighted RRF — incorporates raw scores to penalize low-quality results."""
         scores: dict[str, float] = {}
 
-        for rank, r in enumerate(vector_results):
-            cid = r["chunk_id"]
-            scores[cid] = scores.get(cid, 0) + vector_weight / (RRF_K + rank + 1)
+        if vector_results:
+            max_vec = max((r.get("score", 1.0) for r in vector_results), default=1.0) or 1.0
+            for rank, r in enumerate(vector_results):
+                cid = r["chunk_id"]
+                norm = r.get("score", 1.0) / max_vec
+                scores[cid] = scores.get(cid, 0) + vector_weight * norm / (RRF_K + rank + 1)
 
-        for rank, r in enumerate(bm25_results):
-            cid = r["chunk_id"]
-            scores[cid] = scores.get(cid, 0) + bm25_weight / (RRF_K + rank + 1)
+        if bm25_results:
+            max_bm25 = max((r.get("score", 1.0) for r in bm25_results), default=1.0) or 1.0
+            for rank, r in enumerate(bm25_results):
+                cid = r["chunk_id"]
+                norm = r.get("score", 1.0) / max_bm25
+                scores[cid] = scores.get(cid, 0) + bm25_weight * norm / (RRF_K + rank + 1)
 
         return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
 
     async def _bm25_search(self, query: str, user_id: str, top_k: int) -> list[dict]:
-        """Full-text search via Elasticsearch with jieba Chinese tokenization."""
         try:
             from app.services.es import search as es_search
             return es_search(query, user_id, top_k)
@@ -141,7 +200,6 @@ class SearchService:
             return await self._pg_fts_search(query, user_id, top_k)
 
     async def _pg_fts_search(self, query: str, user_id: str, top_k: int) -> list[dict]:
-        """Fallback: PostgreSQL FTS with jieba tokenization."""
         from app.services.tokenizer import tokenize_query
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         try:
@@ -170,32 +228,22 @@ class SearchService:
             return []
 
     async def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
-        """Rerank candidates via API or local model."""
+        """Rerank with API fallback to cosine similarity (D9)."""
         t0 = time.monotonic()
         try:
             if len(candidates) <= 1:
                 return candidates
 
-            if settings.rerank_backend == "api":
-                result = await self._rerank_api(query, candidates)
-                if result is not None:
-                    return result
-                logger.info("API rerank failed, falling back to local")
-            else:
-                result = await self._rerank_local(query, candidates)
-                if result is not None:
-                    return result
-                logger.info("Local rerank failed, falling back to API")
-                result = await self._rerank_api(query, candidates)
-                if result is not None:
-                    return result
+            result = await self._rerank_api(query, candidates)
+            if result is not None:
+                return result
 
-            return candidates
+            # D9: Local fallback — cosine similarity rerank
+            return await self._local_rerank(query, candidates)
         finally:
             rag_rerank_duration.observe(time.monotonic() - t0)
 
     async def _rerank_api(self, query: str, candidates: list[dict]) -> list[dict] | None:
-        """Rerank via Jina/Cohere-compatible API."""
         if not settings.rerank_api_url:
             return None
         try:
@@ -223,91 +271,95 @@ class SearchService:
                 candidates[idx]["score"] = float(r["relevance_score"])
 
             candidates.sort(key=lambda x: x["score"], reverse=True)
-            logger.info(f"Reranked {len(candidates)} candidates via API")
             return candidates
         except Exception as e:
             logger.warning(f"Rerank API failed: {e}")
             return None
 
-    async def _rerank_local(self, query: str, candidates: list[dict]) -> list[dict] | None:
-        """Rerank via local CrossEncoder model."""
+    async def _local_rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        """D9: Lightweight cosine similarity rerank as API fallback."""
         try:
-            reranker = self._get_reranker()
-            if reranker is None:
-                return None
-
-            pairs = [[query, c["content"]] for c in candidates]
-            raw_scores = reranker.predict(pairs)
-            try:
-                scores = raw_scores.tolist()
-            except AttributeError:
-                scores = raw_scores if isinstance(raw_scores, list) else [raw_scores]
-            scores = [float(s) for s in scores]
-
-            for i, score in enumerate(scores):
-                candidates[i]["score"] = score
-
-            candidates.sort(key=lambda x: x["score"], reverse=True)
-            logger.info(f"Reranked {len(candidates)} candidates via local model")
+            query_vec = await embed_query(query)
+        except Exception as e:
+            logger.warning(f"Local rerank embed failed: {e}")
             return candidates
+
+        q = np.array(query_vec, dtype=np.float32)
+        q_norm = q / (np.linalg.norm(q) + 1e-8)
+
+        store = get_vector_store()
+        chunk_ids = [c["chunk_id"] for c in candidates]
+        try:
+            chunk_vecs = store.get_vectors_by_ids(chunk_ids)
+            for c, vec in zip(candidates, chunk_vecs):
+                v = np.array(vec, dtype=np.float32)
+                v_norm = np.linalg.norm(v)
+                if v_norm > 0:
+                    c["score"] = float(q_norm @ (v / v_norm))
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            logger.info(f"Local rerank (cosine) for {len(candidates)} candidates")
         except Exception as e:
             logger.warning(f"Local rerank failed: {e}")
-            return None
+        return candidates
 
-    _reranker_model = None
-
-    def _get_reranker(self):
-        """Lazy-load bge-reranker model (local fallback only)."""
-        if self.__class__._reranker_model is not None:
-            return self.__class__._reranker_model
+    def _check_data_loss(self, query: str, user_id: str):
+        """D3: Detect potential data loss when retrieval returns nothing."""
         try:
-            import os
-            if not os.environ.get("HF_ENDPOINT"):
-                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-            from sentence_transformers import CrossEncoder
-            logger.info("Loading bge-reranker-v2-m3 (local fallback)...")
-            self.__class__._reranker_model = CrossEncoder(
-                "BAAI/bge-reranker-v2-m3",
-                device="cpu",
-            )
-            logger.info("bge-reranker loaded")
-            return self.__class__._reranker_model
-        except Exception as e:
-            logger.warning(f"Reranker load failed: {e}")
-            return None
+            import asyncio
+            from sqlalchemy.ext.asyncio import async_sessionmaker
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+            async def _check():
+                async with session_factory() as db:
+                    pg_count = await db.execute(
+                        select(func.count()).where(Chunk.user_id == user_id)
+                    )
+                    if pg_count.scalar() > 0:
+                        rag_data_loss.inc()
+
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.ensure_future(_check())
+            except RuntimeError:
+                pass
+        except Exception:
+            pass
 
     async def _fetch_chunks(self, chunk_ids: list[str], user_id: str) -> dict:
+        from app.models.content_pool import ContentPool
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         chunks_map = {}
         async with session_factory() as db:
             result = await db.execute(
-                select(Chunk).where(Chunk.id.in_(chunk_ids), Chunk.user_id == user_id)
+                select(Chunk, ContentPool.content)
+                .join(ContentPool, Chunk.content_hash == ContentPool.content_hash)
+                .where(Chunk.id.in_(chunk_ids), Chunk.user_id == user_id)
             )
-            chunks = result.scalars().all()
+            rows = result.all()
 
             parent_ids = set()
-            for chunk in chunks:
+            for chunk, _ in rows:
                 if chunk.parent_chunk_id:
                     parent_ids.add(str(chunk.parent_chunk_id))
 
-            existing_ids = {str(c.id) for c in chunks}
-            missing_parent_ids = parent_ids - existing_ids
             parent_map = {}
-            if missing_parent_ids:
+            if parent_ids:
                 parent_result = await db.execute(
-                    select(Chunk).where(Chunk.id.in_(list(missing_parent_ids)), Chunk.user_id == user_id)
+                    select(Chunk, ContentPool.content)
+                    .join(ContentPool, Chunk.content_hash == ContentPool.content_hash)
+                    .where(Chunk.id.in_(list(parent_ids)), Chunk.user_id == user_id)
                 )
-                for p in parent_result.scalars().all():
-                    parent_map[str(p.id)] = {
-                        "content": p.content,
-                        "document_id": str(p.document_id),
-                        "page_number": p.page_number,
+                for p_chunk, p_content in parent_result.all():
+                    parent_map[str(p_chunk.id)] = {
+                        "content": p_content,
+                        "document_id": str(p_chunk.document_id),
+                        "page_number": p_chunk.page_number,
                     }
 
-            for chunk in chunks:
+            for chunk, content in rows:
                 parent_data = parent_map.get(str(chunk.parent_chunk_id)) if chunk.parent_chunk_id else None
                 chunks_map[str(chunk.id)] = {
-                    "content": chunk.content,
+                    "content": content,
                     "document_id": str(chunk.document_id),
                     "page_number": chunk.page_number,
                     "parent_content": parent_data["content"] if parent_data else None,

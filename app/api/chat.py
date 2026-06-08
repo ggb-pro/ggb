@@ -17,6 +17,9 @@ from app.services.guard import check_injection
 from app.services.cache import check_rate_limit
 from app.services.citation import validate_citations
 
+# v2.0: lazy import to avoid loading langgraph when use_agent=False
+# from app.agent.router import route_query
+
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
 
@@ -28,6 +31,11 @@ async def chat(
 ):
     search_svc = SearchService()
     llm_svc = LLMService()
+
+    # v2.0: Agent routing
+    if req.use_agent:
+        from app.agent.router import route_query
+        return await route_query(req, user, db)
 
     # Prompt injection check
     is_safe, reason = check_injection(req.query)

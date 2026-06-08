@@ -13,6 +13,9 @@ from app.deps import engine
 from app.models.base import Base
 from app.api import auth, documents, chat, collections, conversations, eval
 
+# Import models so they register with Base.metadata for auto table creation
+import app.models.agent_checkpoint  # noqa: F401
+
 settings = get_settings()
 
 # JSON logging

@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable, AsyncIterator
 
 @runtime_checkable
 class VectorStoreBase(Protocol):
-    async def upsert(self, chunk_ids: list[str], user_id: str, document_id: str,
+    async def insert(self, chunk_ids: list[str], user_id: str, document_id: str,
                      vectors: list[list[float]], snippets: list[str]): ...
     async def search(self, query_vector: list[float], user_id: str,
                      top_k: int) -> list[dict]: ...

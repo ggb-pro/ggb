@@ -12,3 +12,4 @@ class ChatRequest(BaseModel):
     conversation_id: uuid.UUID | None = None
     history: list[ChatMessage] | None = None
     collection_id: uuid.UUID | None = None
+    use_agent: bool = False

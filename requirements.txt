@@ -46,6 +46,13 @@ elasticsearch>=8.0,<9.0
 # Monitoring
 prometheus-fastapi-instrumentator==7.1.0
 
+# Agent framework
+langgraph>=0.2,<0.3
+langchain-core>=0.3,<0.4
+
+# System monitoring
+psutil>=5.9
+
 # Utils
 pydantic-settings==2.7.1
 pydantic==2.10.4

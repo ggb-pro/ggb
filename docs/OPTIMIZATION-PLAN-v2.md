@@ -3,6 +3,7 @@
 > 来源：Agent 工程岗面试 4 大 Case 深度追问 + 工业界对标分析
 > 日期：2026-06-04
 > 基于现有 v2.0 代码，按 P0→P3 优先级排列，标注工期和依赖关系
+> 状态：**全部已实现**（2026-06-04）
 
 ---
 
@@ -692,22 +693,27 @@ async def _llm_resolve(query: str, history: list[dict]) -> str | None:
 ## 实施路线图
 
 ```
-第 1 周（P0 + 关键 P1）
-├── D1-2: C3-1 克隆原子性修复（含 vector_store 新方法）
-├── D3:   C3-2 删除安全性校验
-├── D4-5: C1-2 部分结果补检索 + 分类优先级修复
-└── D5:   C2-1 分级质量输出
+全部已实现 ✅（2026-06-04）
 
-第 2 周（P1 完善 + P2 可观测性）
-├── D1-3: C1-1 LLM 子问题 DAG + execute_tools 增量上下文
-├── D4:   C2-2 adjust_params 多策略扩展
-└── D5:   C4-1 反思评分导出 + agent_trace 写入
+P0 — 数据完整性
+ ✅ C3-1  克隆原子性修复（vector_store.get_vectors_by_ids + Milvus/ES first → PG → ready）
+ ✅ C3-2  删除安全性校验（sibling count 日志审计）
 
-第 3 周（P2 评估 + P3 优化）
-├── D1-2: C4-2 RRF 参数评估框架
-├── D3:   C4-3 ES/PG FTS 回退效果评估
-├── D4:   C2-3 句子边界截断 + C4-4 ES 宕机权重补偿
-└── D5:   C1-3 multi_turn 轻量模型 + 全量回归测试
+P1 — Agent 路径核心功能
+ ✅ C1-1  LLM 子问题 DAG + 分类优先级修复（multi_hop 优先于 compare）
+ ✅ C1-2  零结果补检索（hybrid_search → fulltext_search fallback）
+ ✅ C2-1  反思耗尽后分级质量输出（_build_quality_warning + max_retries_exhausted 保留评分）
+ ✅ C2-2  adjust_params 策略升级（conservative → moderate → aggressive by retry_count）
+
+P2 — 可观测性与评估
+ ✅ C4-1  反思评分 Prometheus Histogram + agent_trace JSONB 写入
+ ✅ C4-2  RRF 参数扫描评估框架（evaluate_rrf_params）
+ ✅ C4-3  ES vs PG FTS 回退效果评估（evaluate_fallback_fts）
+
+P3 — 体验优化
+ ✅ C2-3  句子边界截断（_smart_truncate）
+ ✅ C4-4  ES 宕机动态权重补偿（bm25_weight × 0.5）
+ ✅ C1-3  multi_turn 指代消解改用轻量模型（httpx + agent_lightweight_llm）
 ```
 
 ---

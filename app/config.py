@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "glm-5.1-openai"
 
+    # Agent (v2.0)
+    use_agent: bool = False
+    agent_lightweight_llm: str = "glm-4.5-air"
+    agent_max_retries: int = 2         # max retry attempts after first try (total attempts = 3)
+    agent_max_attempts: int = 3        # total attempts including first try (first + 2 retries)
+    agent_degrade_cpu_threshold: float = 80.0
+    agent_degrade_mem_threshold: float = 85.0
+
     # File storage
     file_storage_path: str = "./data/files"
 

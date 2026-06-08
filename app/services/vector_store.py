@@ -1,4 +1,4 @@
-"""Vector store: Milvus Standalone with pickle fallback."""
+"""Vector store: Milvus Standalone with pickle fallback. Supports content_hash dedup."""
 
 import logging
 from app.config import get_settings
@@ -26,6 +26,7 @@ class MilvusStandaloneStore:
                 FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=36, is_primary=True),
                 FieldSchema(name="user_id", dtype=DataType.VARCHAR, max_length=36, is_partition_key=True),
                 FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=36),
+                FieldSchema(name="content_hash", dtype=DataType.VARCHAR, max_length=64),
                 FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
                 FieldSchema(name="snippet", dtype=DataType.VARCHAR, max_length=8192),
             ])
@@ -52,18 +53,33 @@ class MilvusStandaloneStore:
             })
         self.client.insert(collection_name=COLLECTION_NAME, data=data)
 
+    def insert_batch(self, items: list[dict]):
+        """Insert batch of chunk records with content_hash. Each item: {chunk_id, user_id, document_id, content_hash, vector, snippet}."""
+        data = []
+        for item in items:
+            data.append({
+                "id": item["chunk_id"],
+                "user_id": item["user_id"],
+                "document_id": item["document_id"],
+                "content_hash": item.get("content_hash", ""),
+                "vector": item["vector"],
+                "snippet": item.get("snippet", "")[:8000].encode("utf-8")[:8000].decode("utf-8", errors="ignore"),
+            })
+        self.client.insert(collection_name=COLLECTION_NAME, data=data)
+
     def search(self, query_vector: list[float], user_id: str, top_k: int = 20) -> list[dict]:
         results = self.client.search(
             collection_name=COLLECTION_NAME,
             data=[query_vector],
             filter=f'user_id == "{user_id}"',
             limit=top_k,
-            output_fields=["document_id", "snippet"],
+            output_fields=["document_id", "content_hash", "snippet"],
         )
         if not results or not results[0]:
             return []
         return [
             {"chunk_id": hit["id"], "document_id": hit["entity"]["document_id"],
+             "content_hash": hit["entity"].get("content_hash", ""),
              "score": hit["distance"], "snippet": hit["entity"]["snippet"]}
             for hit in results[0]
         ]
@@ -73,6 +89,31 @@ class MilvusStandaloneStore:
             collection_name=COLLECTION_NAME,
             filter=f'document_id == "{document_id}"',
         )
+
+    def get_vectors_by_ids(self, chunk_ids: list[str]) -> list[list[float]]:
+        """Retrieve stored vectors by chunk IDs."""
+        if not chunk_ids:
+            return []
+        id_filter = ' || '.join(f'id == "{cid}"' for cid in chunk_ids)
+        results = self.client.query(
+            collection_name=COLLECTION_NAME,
+            filter=id_filter,
+            output_fields=["vector"],
+        )
+        id_to_vec = {r["id"]: r["vector"] for r in results}
+        return [id_to_vec.get(cid, [0.0] * EMBEDDING_DIM) for cid in chunk_ids]
+
+    def get_vectors_by_hash(self, content_hash: str) -> list[float] | None:
+        """Retrieve a vector by content_hash (for clone reuse)."""
+        results = self.client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f'content_hash == "{content_hash}"',
+            output_fields=["vector"],
+            limit=1,
+        )
+        if results:
+            return results[0]["vector"]
+        return None
 
 
 class PickleStore:
@@ -114,6 +155,19 @@ class PickleStore:
         self.vectors = self.np.vstack([self.vectors, new_vecs]) if len(self.vectors) else new_vecs
         self._save()
 
+    def insert_batch(self, items: list[dict]):
+        """Insert batch of chunk records with content_hash."""
+        vectors = self.np.array([item["vector"] for item in items], dtype=self.np.float32)
+        for item in items:
+            self.records.append({
+                "chunk_id": item["chunk_id"], "user_id": item["user_id"],
+                "document_id": item["document_id"],
+                "content_hash": item.get("content_hash", ""),
+                "snippet": item.get("snippet", "")[:500],
+            })
+        self.vectors = self.np.vstack([self.vectors, vectors]) if len(self.vectors) else vectors
+        self._save()
+
     def search(self, query_vector, user_id, top_k=20):
         if not self.records:
             return []
@@ -128,6 +182,7 @@ class PickleStore:
         scores = (user_vecs / norms @ q_norm).tolist()
         ranked = sorted(zip(scores, user_records), key=lambda x: x[0], reverse=True)
         return [{"chunk_id": r["chunk_id"], "document_id": r["document_id"],
+                 "content_hash": r.get("content_hash", ""),
                  "score": s, "snippet": r["snippet"]} for s, r in ranked[:top_k]]
 
     def delete_by_document(self, document_id):
@@ -135,6 +190,23 @@ class PickleStore:
         self.records = [r for r, m in zip(self.records, mask) if m]
         self.vectors = self.vectors[mask] if mask.any() else self.np.empty((0, EMBEDDING_DIM), dtype=self.np.float32)
         self._save()
+
+    def get_vectors_by_ids(self, chunk_ids: list[str]) -> list[list[float]]:
+        id_to_idx = {r["chunk_id"]: i for i, r in enumerate(self.records)}
+        result = []
+        for cid in chunk_ids:
+            idx = id_to_idx.get(cid)
+            if idx is not None and idx < len(self.vectors):
+                result.append(self.vectors[idx].tolist())
+            else:
+                result.append([0.0] * EMBEDDING_DIM)
+        return result
+
+    def get_vectors_by_hash(self, content_hash: str) -> list[float] | None:
+        for r, vec in zip(self.records, self.vectors):
+            if r.get("content_hash") == content_hash:
+                return vec.tolist()
+        return None
 
 
 def get_vector_store():

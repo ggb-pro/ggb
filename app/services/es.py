@@ -40,6 +40,7 @@ def _ensure_index():
                     "chunk_id": {"type": "keyword"},
                     "document_id": {"type": "keyword"},
                     "user_id": {"type": "keyword"},
+                    "content_hash": {"type": "keyword"},
                     "content": {"type": "text", "analyzer": "standard"},
                     "content_jieba": {"type": "text", "analyzer": "standard"},
                 },
@@ -63,6 +64,7 @@ def index_chunk(chunk_id: str, document_id: str, user_id: str, content: str):
             "chunk_id": chunk_id,
             "document_id": document_id,
             "user_id": user_id,
+            "content_hash": "",
             "content": content,
             "content_jieba": tokens,
         },
@@ -71,7 +73,7 @@ def index_chunk(chunk_id: str, document_id: str, user_id: str, content: str):
 
 
 def bulk_index_chunks(chunks: list[dict]):
-    """Bulk index multiple chunks. Each dict: {chunk_id, document_id, user_id, content}."""
+    """Bulk index multiple chunks. Each dict: {chunk_id, document_id, user_id, content_hash, content}."""
     from app.services.tokenizer import tokenize
     _ensure_index()
     es = _get_es()
@@ -83,6 +85,7 @@ def bulk_index_chunks(chunks: list[dict]):
             "chunk_id": chunk["chunk_id"],
             "document_id": chunk["document_id"],
             "user_id": chunk["user_id"],
+            "content_hash": chunk.get("content_hash", ""),
             "content": chunk["content"],
             "content_jieba": tokens,
         })
@@ -101,17 +104,29 @@ def search(query: str, user_id: str, top_k: int = 40) -> list[dict]:
     if not tokens.strip():
         return []
 
+    # D4: Dynamic minimum_should_match based on token count
+    token_count = len(tokens.split())
+    if token_count <= 2:
+        min_match = "100%"
+    elif token_count <= 4:
+        min_match = "75%"
+    else:
+        min_match = "60%"
+
     body = {
         "query": {
             "bool": {
                 "must": {"term": {"user_id": user_id}},
                 "should": [
-                    {"match": {"content_jieba": {"query": tokens, "operator": "or"}}},
-                    {"match": {"content": {"query": query, "operator": "or"}}},
+                    {"match": {"content_jieba": {"query": tokens, "operator": "or",
+                                "minimum_should_match": min_match}}},
+                    {"match": {"content": {"query": query, "operator": "or",
+                                "minimum_should_match": min_match}}},
                 ],
                 "minimum_should_match": 1,
             },
         },
+        "min_score": 1.0,
     }
 
     resp = es.search(index=settings.es_index, body=body, size=top_k)

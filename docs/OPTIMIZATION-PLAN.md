@@ -186,10 +186,10 @@
 | LangGraph Checkpoint | ❌ 未实现 |
 | 检索结果缓存 | ❌ 未实现 |
 | 本地 Reranker fallback | ✅ 已移除 |
-| agent_trace JSONB | ❌ SQLAlchemy 模型中未添加该列（仅设计文档 DDL 中有定义） |
+| agent_trace JSONB | ✅ 已添加到 `models/message.py`，router 写入 trace 数据 |
 | collection_id 过滤 | ❌ `search_with_weights()` 接收但静默忽略，Agent 无法按收藏夹过滤 |
 | VectorStoreBase async/sync | ⚠️ Protocol 声明 `async def search` 但实现是同步方法 |
-| multi_turn LLM 模型 | ⚠️ `_llm_resolve` 使用主模型(glm-5.1-openai)，非轻量模型 |
+| multi_turn LLM 模型 | ✅ 已改用 `agent_lightweight_llm`（httpx 直接调用） |
 
 ---
 
@@ -212,10 +212,10 @@ P2（3/3 核心已完成）
  🔄 #9  API 调用计数已接入，token 成本未实现
  ✅ #10 本地 reranker 已移除，httpx 连接池已复用
 
-P3（3/5 已完成）
- ✅ #11 adjust_params 区分失败模式
+P3（4/5 已完成）
+ ✅ #11 adjust_params 区分失败模式（v2 升级为策略升级机制）
  ❌ #12 两套消解实现合并
  🔄 #13 max_retries / max_attempts 语义
  ✅ #14 降级用户提示
- 🔄 #15 未落地特性清理
+ 🔄 #15 未落地特性清理（agent_trace ✅, multi_turn 模型 ✅, 其余未变）
 ```

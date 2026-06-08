@@ -3,9 +3,11 @@ import os
 import json
 import hashlib
 import asyncio
+import logging
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import get_db
@@ -13,12 +15,14 @@ from app.config import get_settings
 from app.models.user import User
 from app.models.document import Document
 from app.models.chunk import Chunk
+from app.models.content_pool import ContentPool
 from app.schemas.document import DocumentOut
 from app.utils.security import get_current_user
 from app.services.vector_store import get_vector_store
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/upload", response_model=DocumentOut)
@@ -78,10 +82,17 @@ async def upload(
 
     if existing:
         # Cross-user dedup: clone chunks for this user
-        doc.processing_status = "chunking"
+        doc.processing_status = "cloning"
         await db.commit()
-        await _clone_chunks_from_existing(db, str(existing.id), doc_id, str(user.id))
-        doc.processing_status = "ready"
+        try:
+            chunk_count = await _clone_chunks_from_existing(db, str(existing.id), doc_id, str(user.id))
+            doc.processing_status = "ready"
+            doc.chunk_count = chunk_count
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).error(f"Clone failed for doc {doc_id}: {e}")
+            doc.processing_status = "failed"
+            doc.processing_error = f"克隆失败: {str(e)[:500]}"
         user.storage_used = (user.storage_used or 0) + file_size
         await db.commit()
         await db.refresh(doc)
@@ -166,43 +177,90 @@ async def delete_doc(
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    # Check if other documents share the same content_hash (for audit logging)
+    siblings = await db.execute(
+        select(func.count()).select_from(Document).where(
+            Document.content_hash == doc.content_hash,
+            Document.id != doc_id,
+            Document.is_deleted == False,
+        )
+    )
+    sibling_count = siblings.scalar()
+    if sibling_count > 0:
+        logger.info(f"Deleting doc {doc_id}, but {sibling_count} other docs share content_hash")
+
     # 1. Clean up vector store
+    milvus_ok = False
     try:
         store = get_vector_store()
         store.delete_by_document(doc_id)
+        milvus_ok = True
     except Exception:
         pass
 
     # 1b. Clean up Elasticsearch
+    es_ok = False
     try:
         from app.services.es import delete_by_document as es_delete
         es_delete(doc_id)
+        es_ok = True
     except Exception:
         pass
 
-    # 2. Delete chunks from DB
+    # 2. Count chunks
     chunk_count = await db.execute(
         select(func.count()).where(Chunk.document_id == doc_id)
     )
     count = chunk_count.scalar() or 0
-    await db.execute(delete(Chunk).where(Chunk.document_id == doc_id))
 
-    # 3. Delete physical file
+    # 3. D1: Deduplicate content_hashes before decrementing ref_count
+    from sqlalchemy import text as sql_text
+    chunk_hashes_result = await db.execute(
+        select(Chunk.content_hash).where(Chunk.document_id == doc_id)
+    )
+    content_hashes = list(set(row[0] for row in chunk_hashes_result.all()))
+
+    if milvus_ok and es_ok:
+        # All external stores cleaned → full cleanup
+        # 4. Delete chunks from DB
+        await db.execute(delete(Chunk).where(Chunk.document_id == doc_id))
+
+        # 5. Decrement ref_count (deduplicated + GREATEST prevents negative)
+        for h in content_hashes:
+            await db.execute(sql_text("""
+                UPDATE content_pool
+                SET ref_count = GREATEST(ref_count - 1, 0)
+                WHERE content_hash = :hash
+            """), {"hash": h})
+
+        # 6. Garbage collect unreferenced content
+        await db.execute(
+            delete(ContentPool).where(ContentPool.ref_count <= 0)
+        )
+    else:
+        # D8: External store delete failed → mark chunks pending, defer cleanup
+        logger.warning(f"Delete doc {doc_id}: Milvus={milvus_ok}, ES={es_ok}, deferring cleanup")
+        await db.execute(
+            update(Chunk).where(Chunk.document_id == doc_id)
+            .values(cleanup_status="pending")
+        )
+
+    # 7. Delete physical file
     if doc.file_path and os.path.exists(doc.file_path):
         try:
             os.remove(doc.file_path)
         except OSError:
             pass
 
-    # 4. Soft delete document
+    # 8. Soft delete document
     doc.is_deleted = True
 
-    # 5. Update user stats
+    # 9. Update user stats
     user.storage_used = max(0, (user.storage_used or 0) - (doc.file_size or 0))
     user.vector_count = max(0, (user.vector_count or 0) - count)
 
     await db.commit()
-    return {"status": "deleted", "chunks_removed": count}
+    return {"status": "deleted", "chunks_removed": count, "cleanup": "done" if milvus_ok and es_ok else "pending"}
 
 
 @router.get("/{doc_id}/status")
@@ -312,43 +370,71 @@ async def import_url(
 
 async def _clone_chunks_from_existing(
     db: AsyncSession, source_doc_id: str, target_doc_id: str, target_user_id: str,
-):
-    """Clone chunks from an existing document for cross-user dedup."""
+) -> int:
+    """Clone chunks via content_pool ref_count — no re-embedding, no Milvus/ES vector copy."""
+    from app.services.es import bulk_index_chunks
+
     result = await db.execute(
-        select(Chunk).where(Chunk.document_id == source_doc_id)
+        select(Chunk, ContentPool)
+        .join(ContentPool, Chunk.content_hash == ContentPool.content_hash)
+        .where(Chunk.document_id == source_doc_id)
     )
-    source_chunks = result.scalars().all()
-    if not source_chunks:
-        return
+    rows = result.all()
+    if not rows:
+        return 0
 
-    # Clone chunks with new IDs pointing to target document
-    old_to_new = {}
-    for chunk in source_chunks:
-        new_id = str(uuid.uuid4())
-        old_to_new[str(chunk.id)] = new_id
-        db.add(Chunk(
-            id=new_id,
-            document_id=target_doc_id,
-            user_id=target_user_id,
-            content=chunk.content,
-            chunk_index=chunk.chunk_index,
-            chunk_type=chunk.chunk_type,
-            parent_chunk_id=chunk.parent_chunk_id,
-            char_start=chunk.char_start,
-            char_end=chunk.char_end,
-            page_number=chunk.page_number,
-            token_count=chunk.token_count,
-        ))
+    old_to_new = {str(chunk.id): str(uuid.uuid4()) for chunk, _ in rows}
 
+    # Step 1: Increment ref_count in content_pool
+    hashes_seen = set()
+    for chunk, pool in rows:
+        if chunk.content_hash not in hashes_seen:
+            pool.ref_count += 1
+            hashes_seen.add(chunk.content_hash)
     await db.commit()
 
-    # Fix parent_chunk_id references to point to new chunk IDs
-    await db.execute(
-        Chunk.__table__.update()
-        .where(Chunk.document_id == target_doc_id)
-        .where(Chunk.parent_chunk_id.isnot(None))
-        .values(parent_chunk_id=func.replace(Chunk.parent_chunk_id.cast(str), Chunk.parent_chunk_id.cast(str), Chunk.parent_chunk_id.cast(str)))
-    )
+    # Step 2: Insert PG chunks (metadata only, content in content_pool)
+    for chunk, _ in rows:
+        db.add(Chunk(
+            id=old_to_new[str(chunk.id)], document_id=target_doc_id,
+            user_id=target_user_id, content_hash=chunk.content_hash,
+            chunk_index=chunk.chunk_index, chunk_type=chunk.chunk_type,
+            parent_chunk_id=chunk.parent_chunk_id,
+            char_start=chunk.char_start, char_end=chunk.char_end,
+            page_number=chunk.page_number,
+        ))
+    await db.commit()
 
-    # Note: parent_chunk_id remapping is best-effort. For exact remapping,
-    # we'd need a second pass. The search still works without exact parent refs.
+    # Step 3: Remap parent_chunk_id
+    cloned = await db.execute(select(Chunk).where(Chunk.document_id == target_doc_id))
+    for chunk in cloned.scalars().all():
+        old_parent = str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None
+        if old_parent and old_parent in old_to_new:
+            chunk.parent_chunk_id = old_to_new[old_parent]
+    await db.commit()
+
+    # Step 4: Insert Milvus entries (vector from content_pool)
+    store = get_vector_store()
+    milvus_items = []
+    for chunk, pool in rows:
+        vec = np.frombuffer(pool.vector, dtype=np.float32).tolist()
+        milvus_items.append({
+            "chunk_id": old_to_new[str(chunk.id)],
+            "user_id": target_user_id,
+            "document_id": target_doc_id,
+            "content_hash": chunk.content_hash,
+            "vector": vec,
+            "snippet": pool.content[:500],
+        })
+    store.insert_batch(milvus_items)
+
+    # Step 5: Insert ES entries (text from content_pool)
+    es_chunks = [
+        {"chunk_id": old_to_new[str(chunk.id)], "document_id": target_doc_id,
+         "user_id": target_user_id, "content_hash": chunk.content_hash,
+         "content": pool.content}
+        for chunk, pool in rows
+    ]
+    bulk_index_chunks(es_chunks)
+
+    return len(rows)
