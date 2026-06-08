@@ -483,15 +483,17 @@ def _validate_resolution(original, resolved, history) -> bool:
 
 ---
 
-### D7. Agent 重试耗尽后三级降级：扩大检索 → 固定管线 → 诚实回答
+### D7. Agent 重试耗尽后：原始 query 全量检索 → 诚实回答
 
 **场景：** "对比 glm-4.5-air 和 glm-5.1-openai 的 token 成本 + 响应延迟" 走 Agent，reflect 发现 groundedness 低，adjust_params 重试 2 次仍失败，返回带幻觉的答案 + 泛化警告。
 
-**根因：** `adjust_params` 最大 top_k=80~100，且不改变检索策略（只调参数不换 query）。重试耗尽后直接返回最后一次答案 + 警告，不尝试降级到固定管线。
+**根因：** `adjust_params` 最大 top_k=80~100，且不改变检索策略（只调参数不换 query）。重试耗尽后直接返回最后一次答案 + 警告，幻觉数据原样输出。
 
 **修复方案：**
 
-**1) `adjust_params` 增加 level 3 最终策略 — 原始 query 整体检索：**
+**1) `adjust_params` 增加 level 3 最终策略 — 原始 query 全量检索：**
+
+前 2 轮重试都是在 LLM 拆出的子查询上做参数微调。如果问题出在子查询本身（拆得太碎、丢了关键信息），调参救不了。最终策略是放弃子查询拆分，用原始 query 做一次全量检索：
 
 ```python
 def adjust_params(state: AgentState) -> dict:
@@ -521,28 +523,31 @@ def _route_after_reflect(state: AgentState) -> str:
     return "end"
 ```
 
-**3) Agent 重试全部耗尽后降级到固定管线：**
+**3) 重试全部耗尽后直接诚实回答：**
+
+Agent 已尝试：子查询拆分（level 0-1）→ 切换 fulltext_search（level 2）→ 原始 query 全量检索（level 3），共 4 次尝试。此时不应再尝试更弱的检索方式（固定管线只有单次检索，不可能比 Agent 4 次尝试找到更多数据），直接输出结构化的"无法回答"：
 
 ```python
+NO_DATA_RESPONSE = """抱歉，在您的知识库中未能找到足够的准确数据来完整回答此问题。
+
+**已尝试**：{attempts} 次不同检索策略
+**缺失信息**：{missing_info}
+**建议**：
+1. 确认相关文档是否已上传至知识库
+2. 尝试使用更具体的关键词重新提问
+3. 直接查阅原始文档确认数据"""
+
 # router.py _agent_stream 中
 if result_state.get("reflection_result") == "max_retries_exhausted":
-    yield agent_step("降级扩大检索")
-    search_svc = SearchService()
-    expanded = await search_svc.search_with_weights(
-        query=resolved_query, user_id=user_id,
-        top_k=60, vector_weight=0.5, bm25_weight=0.5,
+    scores = result_state.get("reflection_scores", {})
+    warning = _build_quality_warning("max_retries_exhausted", scores, retry_count)
+    answer = NO_DATA_RESPONSE.format(
+        attempts=retry_count + 1,
+        missing_info=_infer_missing_info(scores, result_state.get("chunks", [])),
     )
-    if len(expanded) > len(result_state.get("chunks", [])):
-        # 固定管线找到更多结果 → 重新生成
-        context = search_svc.build_context(expanded)
-        async for token in llm_svc.stream_generate(req.query, context):
-            yield token...
-    else:
-        # 固定管线也没更多结果 → 诚实回答
-        yield NO_DATA_RESPONSE.format(...)
 ```
 
-**工期：** 2 天
+**工期：** 1.5 天
 
 ---
 
@@ -803,8 +808,8 @@ Phase 2 — 检索与回答质量（5.5 天）
   D6  指代消解三级改造                                 2d
   ← 里程碑：检索准确率提升
 
-Phase 3 — 系统韧性（5 天）
-  D7  Agent 重试降级链路                               2d
+Phase 3 — 系统韧性（6.5 天）
+  D7  Agent 重试耗尽 → 原始 query 全量检索 → 诚实回答     1.5d
   D8  删除一致性三层防御                               2d
   D9  带宽分级降级                                    3d
   ← 里程碑：故障自愈能力
