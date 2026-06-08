@@ -249,11 +249,11 @@ def _rrf_fuse(self, vector_results, bm25_results, vector_weight, bm25_weight):
 
 ---
 
-### D5. 查询分类器升级为多标签 + 置信度驱动路由
+### D5. 查询分类器重构 — LLM 为主 + 规则快路径
 
-**场景：** "文档中 ID 为 89756 的腾讯云服务器，对比 2024 和 2023 年的 API 成本，并说明成本差异的核心原因"——同时命中 keyword + compare + multi_hop 三种特征，但单标签分类器只能选一个，keyword 信息丢失。且 `_EXACT_PATTERNS` 不匹配纯数字 ID。
+**场景：** "文档中 ID 为 89756 的腾讯云服务器，对比 2024 和 2023 年的 API 成本，并说明成本差异的核心原因"——同时命中 keyword + compare + multi_hop 三种特征，但单标签规则分类器只能选一个，keyword 信息丢失。
 
-**根因：** `_classify` 返回单一标签（`query_analyzer.py:77-89`），`_EXACT_PATTERNS` 只匹配引号和 UUID 格式。
+**设计原则：** 以 LLM 判断为主，规则仅处理**明确的正则命中**场景（引号包裹、UUID、纯数字 ID 等无歧义的模式），作为零延迟快路径跳过 LLM 调用。
 
 **修复方案：**
 
@@ -261,53 +261,100 @@ def _rrf_fuse(self, vector_results, bm25_results, vector_weight, bm25_weight):
 @dataclass
 class AnalyzedQuery:
     original: str
-    query_type: str           # 主类型（决定路由）
-    sub_types: list[str]      # 所有命中的类型标签
+    query_type: str           # 主类型：keyword / semantic / compare / multi_hop
+    sub_types: list[str]      # 所有命中的类型标签（多标签）
     has_keyword: bool         # 是否包含精确匹配需求
     rewritten: str
     sub_queries: list[str]
     vector_weight: float
     bm25_weight: float
 
-def _classify(self, query: str) -> tuple[str, list[str], bool]:
-    tags = set()
-    if _EXPANDED_EXACT_PATTERNS.search(query):
-        tags.add("keyword")
-    if _COMPARE_PATTERNS.search(query):
-        tags.add("compare")
-    if _MULTI_ENTITY_PATTERNS.search(query):
-        tags.add("multi_hop")
-    if _SEMANTIC_PATTERNS.search(query):
-        tags.add("semantic")
 
-    has_keyword = "keyword" in tags
+class QueryAnalyzer:
+    # 规则快路径：只有这些无歧义的正则模式才跳过 LLM
+    _FAST_KEYWORD = re.compile(
+        r'".+?"|\'.+?\'|'            # 引号包裹：精确引用
+        r'[\w\d]{8,}-[\w\d]{4,}'     # UUID 格式：550e8400-e29b
+    )
 
-    # 路由：compare/multi_hop → complex；keyword 标记不阻塞路由但传递给 Agent
-    if tags & {"compare", "multi_hop"}:
-        query_type = "complex"
-    elif "keyword" in tags:
-        query_type = "keyword"
-    else:
-        query_type = "semantic"
+    def analyze(self, query, history=None) -> AnalyzedQuery:
+        q = query.strip()
 
-    return query_type, list(tags), has_keyword
+        # 1. 引用消解（有历史时）
+        if history:
+            q = self._resolve_refs(q, history)
+
+        # 2. 噪声词清理
+        rewritten = self._rewrite(q)
+
+        # 3. 分类：规则快路径 → LLM 主路径
+        query_type, sub_types, has_keyword = self._classify(q)
+
+        # 4. 子查询拆分（LLM 主路径已包含拆分结果）
+        if query_type in ("compare", "multi_hop") and len(sub_types) > 1:
+            sub_queries = self._decompose(q, query_type)
+        else:
+            sub_queries = [rewritten]
+
+        # 5. 权重
+        if has_keyword:
+            vw, bw = 0.3, 0.7
+        else:
+            vw, bw = 0.7, 0.3
+
+        return AnalyzedQuery(
+            original=query, query_type=query_type, sub_types=sub_types,
+            has_keyword=has_keyword, rewritten=rewritten,
+            sub_queries=sub_queries, vector_weight=vw, bm25_weight=bw,
+        )
+
+    def _classify(self, query: str) -> tuple[str, list[str], bool]:
+        # 规则快路径：明确的 keyword 模式直接返回，零延迟
+        if self._FAST_KEYWORD.search(query):
+            return "keyword", ["keyword"], True
+
+        # LLM 主路径：让模型判断 query 的完整语义
+        return self._llm_classify(query)
+
+    def _llm_classify(self, query: str) -> tuple[str, list[str], bool]:
+        """轻量 LLM 分类，返回 (主类型, 多标签, 是否含 keyword)。"""
+        prompt = f"""分析以下用户查询，输出 JSON。
+
+用户查询：{query}
+
+判断维度：
+1. query_type（主类型，必选其一）：
+   - keyword: 包含精确 ID/编号/错误码等需要精确匹配的内容
+   - semantic: 开放式问答（为什么/怎么/什么是）
+   - compare: 对比类查询（A vs B、区别、差异）
+   - multi_hop: 需要多步推理或跨实体关联
+2. sub_types（所有命中的类型，可多选）：keyword/semantic/compare/multi_hop
+3. has_keyword: 是否包含需要精确匹配的关键词（ID/编号/错误码）
+
+输出：{{"query_type": "...", "sub_types": [...], "has_keyword": true/false}}"""
+
+        raw = await _call_lightweight_llm(prompt, max_tokens=150)
+        parsed = _extract_json(raw)
+
+        if parsed and isinstance(parsed, dict):
+            qt = parsed.get("query_type", "semantic")
+            st = parsed.get("sub_types", [qt])
+            hk = parsed.get("has_keyword", False)
+            if qt not in {"keyword", "semantic", "compare", "multi_hop"}:
+                qt = "semantic"
+            return qt, st, hk
+
+        # LLM 失败兜底：默认 semantic
+        return "semantic", ["semantic"], False
 ```
 
-**扩展 `_EXACT_PATTERNS`：**
-
-```python
-_EXACT_PATTERNS = re.compile(
-    r'".+?"|\'.+?\'|'                # 引号包裹
-    r'[\w\d]{8,}-[\w\d]{4,}|'        # UUID 格式
-    r'ID\s*[为是:：]\s*\S+|'          # "ID 为 89756"
-    r'\b\d{4,}\b|'                    # 4 位以上纯数字
-    r'[A-Z]{2,}[-_]?\d{2,}'          # ORD-2234 类编码
-)
-```
+**路由逻辑保持不变：** `intent_classify` 节点根据 `query_type` 判断 simple/complex。多标签和 `has_keyword` 传递给 Agent 的 `generate_plan` 使用。
 
 **Agent 规划注入 keyword 提示（`generate_plan`）：**
 
 ```python
+# 从 AnalyzedQuery 获取 has_keyword 信号
+analyzed = _analyzer.analyze(state["query"])
 if analyzed.has_keyword:
     keyword_hint = """重要：该查询包含精确关键词（ID/编号），必须在检索计划中优先使用
 fulltext_search 定位精确匹配，再结合 hybrid_search 获取语义内容。"""
@@ -317,72 +364,90 @@ fulltext_search 定位精确匹配，再结合 hybrid_search 获取语义内容�
 
 ---
 
-### D6. 多轮指代消解改造 — 主语优先 + 置信度路由 + LLM 校验
+### D6. 多轮指代消解重构 — LLM 为主 + 规则快路径 + 校验
 
 **场景：** 第一轮 "文档里的 AI 模型月成本是多少？" → 第二轮 "它的年维护费呢？"。规则层取最后一个实体 "月成本" 替换 "它"，得到 "月成本的年维护费呢？"（错误）。且规则层改了之后 LLM 层不执行（串行互斥）。
 
-**根因：** `_rule_based_resolve` 取 `entities[-1]`（`multi_turn.py:56`），不区分主语/宾语。规则层产出任何结果后 LLM 层被跳过（`multi_turn.py:30-32`）。
+**设计原则：** 以 LLM 消解为主，规则仅处理**明确的代词替换模式**（如查询中只有单一实体+单一代词，无歧义），作为零延迟快路径。
 
-**修复方案 — 三级消解：**
+**修复方案 — LLM 主路径 + 规则快路径 + 校验兜底：**
 
 ```python
+# 明确的快路径模式：上下文中只有一个候选实体 + 查询中只有一个代词
+_FAST_PRONOUN = re.compile(r'^(它|他|她|这个|那个|这|那|其|此)')
+
 async def resolve_query_with_history(query, history_messages, use_llm=True):
     if not history_messages or not _PRONOUNS_ZH.search(query):
         return query
 
-    resolved, confidence = _rule_based_resolve(query, history_messages)
+    # 快路径：明确的单实体替换（无歧义场景）
+    fast_resolved = _fast_rule_resolve(query, history_messages)
+    if fast_resolved != query:
+        return fast_resolved  # 零延迟直接返回
 
-    if resolved != query and confidence >= 0.8:
-        return resolved  # 高置信度：规则层搞定
-
-    # 低置信度或规则层没搞定 → LLM 兜底
+    # 主路径：LLM 消解
     if use_llm:
         llm_resolved = await _llm_resolve(query, history_messages[-6:])
         if llm_resolved and _validate_resolution(query, llm_resolved, history_messages):
             return llm_resolved
 
-    # 都没搞定：拼接最近 user 消息作为查询扩展
-    if resolved != query:
-        return resolved  # 规则层低置信度结果仍比原 query 好
+    # 兜底：拼接最近 user 消息作为查询扩展
     last_user = [m for m in history_messages if m["role"] == "user"][-1]["content"]
     return f"{last_user}，{query}"
-```
 
-**规则层改为从最近 user 消息提取主语：**
 
-```python
-def _rule_based_resolve(query, history) -> tuple[str, float]:
+def _fast_rule_resolve(query, history) -> str:
+    """规则快路径：仅处理无歧义的单实体+单代词场景。
+
+    条件（全部满足才触发）：
+    1. 查询以代词开头（"它的..."），而非中间出现（"这个和那个..."）
+    2. 上一轮 user 消息中只有一个明确的话题实体
+    """
+    if not _FAST_PRONOUN.match(query):
+        return query
+
     recent_user = [m for m in history[-4:] if m["role"] == "user"]
     if not recent_user:
-        return query, 0.0
+        return query
 
     last_user = recent_user[-1]["content"]
-    subject_match = re.match(
-        r'.*?(?:的|之)\s*([一-鿿A-Za-z0-9\s]{2,10})(?:是|有|为|多|呢|的)',
-        last_user
-    )
-    if subject_match:
-        target = subject_match.group(1).strip()
+    # 提取上一轮 user 消息中的实体
+    entities = _extract_topic_entities(last_user)
+
+    # 只有唯一候选时才用规则替换，否则交给 LLM 判断
+    if len(entities) == 1:
+        target = entities[0]
         for pronoun in ["它", "他", "她", "这个", "那个"]:
-            if pronoun in query:
-                return query.replace(pronoun, target, 1), 0.9
+            if query.startswith(pronoun):
+                return query.replace(pronoun, target, 1)
 
-    # 低置信度兜底
+    return query
+
+
+def _extract_topic_entities(text: str) -> list[str]:
+    """从用户消息中提取话题实体（主语级名词短语）。
+
+    提取策略：
+    1. "的" 前的名词短语（"文档里的 AI 模型" → "AI 模型"）
+    2. 大写开头的英文术语（"glm-5.1"）
+    3. 返回去重后的列表
+    """
     entities = []
-    for msg in history[-3:]:
-        entities.extend(_ENTITY_PATTERN.findall(msg.get("content", "")))
-    if entities:
-        return query.replace("它", entities[-1], 1), 0.3
-
-    return query, 0.0
+    # 匹配 "的/之" 前面的名词短语
+    for m in re.finditer(r'([一-鿿A-Za-z0-9\s\-\.]{2,15})(?:的|之)', text):
+        candidate = m.group(1).strip()
+        if len(candidate) >= 2:
+            entities.append(candidate)
+    return list(dict.fromkeys(entities))  # 保序去重
 ```
 
 **LLM 消解结果校验（防幻觉）：**
 
 ```python
 def _validate_resolution(original, resolved, history) -> bool:
-    new_terms = set(re.findall(r'[一-鿿]{2,8}|[A-Z][a-zA-Z]+', resolved)) - \
-                set(re.findall(r'[一-鿿]{2,8}|[A-Z][a-zA-Z]+', original))
+    """校验 LLM 消解结果：新词必须在历史中出现过。"""
+    new_terms = set(re.findall(r'[一-鿿]{2,8}|[A-Z][a-zA-Z0-9\-]+', resolved)) - \
+                set(re.findall(r'[一-鿿]{2,8}|[A-Z][a-zA-Z0-9\-]+', original))
     if not new_terms:
         return False
     history_text = " ".join(m.get("content", "") for m in history)
@@ -393,6 +458,25 @@ def _validate_resolution(original, resolved, history) -> bool:
     if len(resolved) > len(original) * 3:
         return False
     return True
+```
+
+**回推 D6 场景验证：**
+
+```
+第一轮 user: "文档里的 AI 模型月成本是多少？"
+第二轮 user: "它的年维护费呢？"
+
+快路径检查：
+  - query 以 "它" 开头 → 命中 _FAST_PRONOUN ✓
+  - 上一轮 user: "文档里的 AI 模型月成本是多少？"
+  - _extract_topic_entities: "AI 模型"（"的" 前的名词短语）
+  - 候选数 = 1 → 无歧义 → 规则替换
+  - 结果："AI 模型的年维护费呢？" ✓
+
+多歧义场景（不走快路径，走 LLM）：
+  第二轮: "它和那个的区别是什么？"
+  - query 不以代词开头（以"它和..."开头，不是单一代词）→ 快路径不触发
+  - LLM 主路径消解
 ```
 
 **工期：** 2 天
